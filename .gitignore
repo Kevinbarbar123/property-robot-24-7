@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+logs/
+reports/
+
+data/*_state.json
+
+.env.private
+
