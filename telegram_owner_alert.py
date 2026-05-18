@@ -33,6 +33,7 @@ from urllib.request import Request, urlopen
 from property_bot import (
     BASE_URL,
     Listing,
+    extract_olx_search_hits,
     fetch_url,
     is_apartment_candidate,
     money,
@@ -92,118 +93,147 @@ def log_crash(exc: BaseException) -> None:
 OLX_TARGET_SEARCHES = {
     "Fanar": {
         "query": "fanar",
+        "location": "fanar",
         "aliases": ["fanar"],
     },
     "Mar Roukoz": {
         "query": "mar-roukoz",
+        "location": "mar_roukoz",
         "aliases": ["mar roukoz", "mar roukos", "mar-roukoz", "mar-roukos"],
     },
     "Broumana": {
         "query": "broumana",
+        "location": "broummana",
         "aliases": ["broumana", "broummana", "brummana", "broumana metn"],
     },
     "Beit Mery": {
         "query": "beit-mery",
+        "location": "beit-meri",
         "aliases": ["beit mery", "beit merry", "beit-mery"],
     },
     "Jdeideh": {
         "query": "jdeideh",
+        "location": "jdaide",
         "aliases": ["jdeideh", "jdeide", "jdaide", "jdeidet el metn", "jdeidet"],
     },
     "Rawda": {
         "query": "rawda",
+        "location": "new-rawda",
         "aliases": ["rawda", "new rawda", "rawda metn"],
     },
     "Bsalim": {
         "query": "bsalim",
+        "location": "bsalim",
         "aliases": ["bsalim", "bsaleem", "bsalim metn"],
     },
     "Mezher": {
         "query": "mezher",
+        "location": "mezher",
         "aliases": ["mezher", "mazher", "mezher metn"],
     },
     "Biakout": {
         "query": "biakout",
+        "location": "biaqout",
         "aliases": ["biakout", "biaqout", "biyakout", "biakout metn"],
     },
     "Sabtieh": {
         "query": "sabtieh",
+        "location": "sabtieh",
         "aliases": ["sabtieh", "sabtaieh", "sabteih", "sabtaieh metn"],
     },
     "Dekwaneh": {
         "query": "dekwaneh",
+        "location": "dekwaneh",
         "aliases": ["dekwaneh", "dekouaneh", "dekouane"],
     },
     "Mkalles": {
         "query": "mkalles",
+        "location": "mkalles",
         "aliases": ["mkalles", "mekalles", "mkaless", "mkalles metn"],
     },
     "Sin El Fil": {
         "query": "sin-el-fil",
+        "location": "sin-el-fil",
         "aliases": ["sin el fil", "sin-el-fil", "sinelfil", "sin el fill"],
     },
     "Jisr El Bacha": {
         "query": "jisr-el-bacha",
+        "location": "jisr-el-bacha",
         "aliases": ["jisr el bacha", "jisr-el-bacha", "jesr el bacha"],
     },
     "Horsh Tabet": {
         "query": "horch-tabet",
+        "location": "horsh-tabet",
         "aliases": ["horsh tabet", "horch tabet", "horch-tabet", "horsh-tabet"],
     },
     "Baouchrieh": {
         "query": "baouchrieh",
+        "location": "baouchriye",
         "aliases": ["baouchrieh", "bauchrieh", "baouchriyeh", "sad el baouchrieh", "sed el baouchrieh"],
     },
     "Rabweh": {
         "query": "rabweh",
+        "location": "rabweh",
         "aliases": ["rabweh", "rabieh", "rabieh metn"],
     },
     "Zalka": {
         "query": "zalka",
+        "location": "zalqa",
         "aliases": ["zalka"],
     },
     "Jal El Dib": {
         "query": "jal-el-dib",
+        "location": "jall-el-dieb",
         "aliases": ["jal el dib", "jall el dib", "jal-el-dib", "jall-el-dib"],
     },
     "Antelias": {
         "query": "antelias",
+        "location": "antilias",
         "aliases": ["antelias"],
     },
     "Dbayeh": {
         "query": "dbayeh-metn",
+        "location": "dbaye",
         "aliases": ["dbayeh", "dbaye", "d bayeh"],
     },
     "Nahr El Mott": {
         "query": "nahr-el-mott",
+        "location": "nahr-el-mott",
         "aliases": ["nahr el mott", "nahr el mot", "nahr-el-mott", "nahr-el-mot"],
     },
     "Kornet Chehwan": {
         "query": "kornet-chehwan",
+        "location": "qornet_chahouane",
         "aliases": ["kornet chehwan", "cornet chehwan", "qornet chehwan", "kornet-chehwan"],
     },
     "Ain Saadeh": {
         "query": "ain-saadeh",
+        "location": "ain_saadeh",
         "aliases": ["ain saadeh", "ain saade", "ain-saadeh", "ain-saade"],
     },
     "Mansourieh": {
         "query": "mansourieh",
+        "location": "mansouriyeh",
         "aliases": ["mansourieh", "mansourieh metn", "mansouriyeh"],
     },
     "Monteverde": {
         "query": "monteverde",
+        "location": "monteverde",
         "aliases": ["monteverde", "monte verdi"],
     },
     "Roumieh": {
         "query": "roumieh",
+        "location": "roumieh",
         "aliases": ["roumieh", "roumie"],
     },
     "Tilal Ain Saadeh": {
         "query": "tilal-ain-saade",
+        "location": "tilal-ain-saade",
         "aliases": ["tilal ain saadeh", "tilal ain saade", "tilal-ain-saadeh", "tilal-ain-saade"],
     },
     "Ain Najem": {
         "query": "ain-najm",
+        "location": "ain-najm",
         "aliases": ["ain najm", "ain najem", "ain-najm", "ain-najem"],
     },
 }
@@ -339,6 +369,10 @@ def extract_balanced_json_object(text: str, start: int) -> str:
 
 
 def extract_search_result_objects(raw_html: str) -> list[dict]:
+    next_data_hits = extract_olx_search_hits(raw_html)
+    if next_data_hits:
+        return next_data_hits
+
     objects: list[dict] = []
     seen_ids: set[str] = set()
     position = 0
@@ -987,8 +1021,11 @@ def balanced_detail_candidates(details_list: list[SellerDetails], limit: int) ->
     return selected
 
 
-def olx_search_url(category_slug: str, query_slug: str, page: int) -> str:
-    url = f"{BASE_URL}/properties/{category_slug}/q-apartments-{query_slug}/"
+def olx_search_url(category_slug: str, query_slug: str, page: int, location_slug: str = "") -> str:
+    if location_slug:
+        url = f"{BASE_URL}/properties/{category_slug}/{location_slug}/"
+    else:
+        url = f"{BASE_URL}/properties/{category_slug}/q-apartments-{query_slug}/"
     if page > 1:
         url = f"{url}?page={page}"
     return url
@@ -1001,7 +1038,8 @@ def collect_fanar_radius_seed_details(max_pages: int, delay: float) -> list[Sell
     for purpose, category_slug in OLX_PURPOSES.items():
         for area, config in OLX_TARGET_SEARCHES.items():
             query = config["query"]
-            first_url = olx_search_url(category_slug, query, 1)
+            location = config.get("location", "")
+            first_url = olx_search_url(category_slug, query, 1, location)
             print(f"Fetching {purpose} {area}: {first_url}", file=sys.stderr)
             try:
                 first_html = fetch_url(first_url, timeout=15, retries=1)
@@ -1014,7 +1052,7 @@ def collect_fanar_radius_seed_details(max_pages: int, delay: float) -> list[Sell
 
             for page in range(2, page_count + 1):
                 time.sleep(delay)
-                url = olx_search_url(category_slug, query, page)
+                url = olx_search_url(category_slug, query, page, location)
                 print(f"Fetching {purpose} {area} page {page}/{page_count}: {url}", file=sys.stderr)
                 try:
                     raw_html = fetch_url(url, timeout=15, retries=1)

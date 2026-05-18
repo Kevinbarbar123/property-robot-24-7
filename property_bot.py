@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import json
 import re
 import sys
 import time
@@ -20,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -43,62 +44,77 @@ NON_APARTMENT_TERMS = (
 CITY_SEARCHES = {
     "Fanar": {
         "query": "fanar",
+        "location": "fanar",
         "aliases": ["fanar"],
     },
     "Jdeideh": {
         "query": "jdeideh",
+        "location": "jdaide",
         "aliases": ["jdeide", "jdeideh", "jdeidet", "jdeidet el metn"],
     },
     "Bsalim": {
         "query": "bsalim",
+        "location": "bsalim",
         "aliases": ["bsalim", "bsaleem", "bsalim metn"],
     },
     "Mezher": {
         "query": "mezher",
+        "location": "mezher",
         "aliases": ["mezher", "mazher", "mezher metn"],
     },
     "Biakout": {
         "query": "biakout",
+        "location": "biaqout",
         "aliases": ["biakout", "biaqout", "biyakout", "biakout metn"],
     },
     "Mkalles": {
         "query": "mkalles",
+        "location": "mkalles",
         "aliases": ["mkalles", "mekalles", "mkaless", "mkalles metn"],
     },
     "Sin El Fil": {
         "query": "sin-el-fil",
+        "location": "sin-el-fil",
         "aliases": ["sin el fil", "sin-el-fil", "sinelfil", "sin el fill"],
     },
     "Jisr El Bacha": {
         "query": "jisr-el-bacha",
+        "location": "jisr-el-bacha",
         "aliases": ["jisr el bacha", "jisr-el-bacha", "jesr el bacha"],
     },
     "Horsh Tabet": {
         "query": "horch-tabet",
+        "location": "horsh-tabet",
         "aliases": ["horsh tabet", "horch tabet", "horch-tabet", "horsh-tabet"],
     },
     "Baouchrieh": {
         "query": "baouchrieh",
+        "location": "baouchriye",
         "aliases": ["baouchrieh", "bauchrieh", "baouchriyeh", "sad el baouchrieh", "sed el baouchrieh"],
     },
     "Nahr El Mott": {
         "query": "nahr-el-mott",
+        "location": "nahr-el-mott",
         "aliases": ["nahr el mott", "nahr el mot", "nahr-el-mott", "nahr-el-mot"],
     },
     "Kornet Chehwan": {
         "query": "kornet-chehwan",
+        "location": "qornet_chahouane",
         "aliases": ["kornet chehwan", "cornet chehwan", "qornet chehwan", "kornet-chehwan"],
     },
     "Ain Saadeh": {
         "query": "ain-saadeh",
+        "location": "ain_saadeh",
         "aliases": ["ain saadeh", "ain saade", "ain-saadeh", "ain-saade"],
     },
     "Broumana": {
         "query": "broumana",
+        "location": "broummana",
         "aliases": ["broumana", "broummana", "brummana"],
     },
     "Mar Roukoz": {
         "query": "mar-roukoz",
+        "location": "mar_roukoz",
         "aliases": ["mar roukoz", "mar roukos", "mar-roukoz", "mar-roukos"],
     },
 }
@@ -181,14 +197,135 @@ def fetch_url(url: str, timeout: int = 30, retries: int = 2, retry_delay: float 
     raise TimeoutError(f"Unable to fetch {url}")
 
 
-def olx_search_url(query_slug: str, page: int) -> str:
-    url = f"{BASE_URL}/properties/apartments-villas-for-sale/q-apartments-{query_slug}/"
+def olx_search_url(query_slug: str, page: int, location_slug: str = "") -> str:
+    if location_slug:
+        url = f"{BASE_URL}/properties/apartments-villas-for-sale/{location_slug}/"
+    else:
+        url = f"{BASE_URL}/properties/apartments-villas-for-sale/q-apartments-{query_slug}/"
     if page > 1:
         url = f"{url}?page={page}"
     return url
 
 
+def extract_next_data(raw_html: str) -> dict:
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', raw_html, flags=re.S)
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def extract_olx_search_hits(raw_html: str) -> list[dict]:
+    data = extract_next_data(raw_html)
+    page_props = data.get("props", {}).get("pageProps", {}) if isinstance(data.get("props"), dict) else {}
+    initial_state = page_props.get("initialState") if isinstance(page_props, dict) else {}
+    if not isinstance(initial_state, dict):
+        initial_state = data.get("props", {}).get("initialState", {}) if isinstance(data.get("props"), dict) else {}
+    search = initial_state.get("search") if isinstance(initial_state, dict) else {}
+    if not isinstance(search, dict):
+        return []
+
+    hits: list[dict] = []
+    seen_ids: set[str] = set()
+    for key in ("featuredAds", "ads", "eliteAds"):
+        section = search.get(key)
+        section_hits = section.get("hits") if isinstance(section, dict) else None
+        if not isinstance(section_hits, list):
+            continue
+        for item in section_hits:
+            if not isinstance(item, dict):
+                continue
+            external_id = str(item.get("externalID") or item.get("id") or "")
+            if not external_id or external_id in seen_ids:
+                continue
+            seen_ids.add(external_id)
+            hits.append(item)
+    return hits
+
+
+def item_location_text(item: dict) -> str:
+    locations = item.get("location") or item.get("locationTranslations") or []
+    names: list[str] = []
+    if isinstance(locations, list):
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            if "en" in location and isinstance(location["en"], dict):
+                name = location["en"].get("name")
+            else:
+                name = location.get("name")
+            if name and name not in {"Lebanon"}:
+                names.append(normalize_text(str(name)))
+    return ", ".join(reversed(names))
+
+
+def safe_int(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
+        return None
+
+
+def created_label_from_timestamp(timestamp: object) -> str:
+    try:
+        value = float(timestamp)
+    except (TypeError, ValueError):
+        return ""
+    age_days = (datetime.now() - datetime.fromtimestamp(value)).days
+    if age_days <= 0:
+        return "today"
+    if age_days == 1:
+        return "yesterday"
+    if age_days < 14:
+        return f"{age_days} days ago"
+    return f"{max(2, round(age_days / 7))} weeks ago"
+
+
+def olx_listing_url(item: dict) -> str:
+    external_id = normalize_text(str(item.get("externalID") or ""))
+    slug = normalize_text(str(item.get("slug") or ""))
+    if not external_id or not slug:
+        return ""
+    return f"{BASE_URL}/ad/{quote(slug, safe='-')}-ID{external_id}.html"
+
+
+def parse_olx_json_page(raw_html: str, city: str, aliases: Iterable[str], strict: bool) -> list[Listing]:
+    listings: list[Listing] = []
+    alias_terms = [normalize_for_match(alias) for alias in aliases]
+    for item in extract_olx_search_hits(raw_html):
+        title = normalize_text(str(item.get("title") or ""))
+        url = olx_listing_url(item)
+        if not title or not url:
+            continue
+        location = item_location_text(item)
+        match_blob = normalize_for_match(f"{title} {location} {item.get('description') or ''}")
+        if strict and not any(term in match_blob for term in alias_terms):
+            continue
+        extra_fields = item.get("extraFields") if isinstance(item.get("extraFields"), dict) else {}
+        listings.append(
+            Listing(
+                city=city,
+                title=title,
+                price_usd=safe_int(extra_fields.get("price")) or safe_int(item.get("price")),
+                sqm=safe_int(extra_fields.get("ft")),
+                location=location,
+                created=created_label_from_timestamp(item.get("timestamp") or item.get("createdAt")),
+                url=url,
+            )
+        )
+    return listings
+
+
 def parse_olx_page(raw_html: str, city: str, aliases: Iterable[str], strict: bool) -> list[Listing]:
+    json_listings = parse_olx_json_page(raw_html, city, aliases, strict)
+    if json_listings:
+        return json_listings
+
     blocks = re.findall(r'<li class="" aria-label="Listing">(.*?)</li>', raw_html)
     listings: list[Listing] = []
     alias_terms = [normalize_for_match(alias) for alias in aliases]
@@ -231,6 +368,20 @@ def extract_first(text: str, pattern: str) -> str | None:
 
 
 def parse_page_count(raw_html: str) -> int:
+    data = extract_next_data(raw_html)
+    page_props = data.get("props", {}).get("pageProps", {}) if isinstance(data.get("props"), dict) else {}
+    initial_state = page_props.get("initialState") if isinstance(page_props, dict) else {}
+    search = initial_state.get("search") if isinstance(initial_state, dict) else {}
+    if isinstance(search, dict):
+        page_counts = []
+        for key in ("ads", "featuredAds", "eliteAds"):
+            section = search.get(key)
+            if isinstance(section, dict):
+                count = safe_int(section.get("pageCount"))
+                if count:
+                    page_counts.append(count)
+        if page_counts:
+            return max(page_counts)
     match = re.search(r'"page_count":(\d+)', raw_html)
     return int(match.group(1)) if match else 1
 
@@ -240,8 +391,9 @@ def collect_olx(max_pages: int, delay: float, strict: bool) -> list[Listing]:
 
     for city, config in CITY_SEARCHES.items():
         query = config["query"]
+        location = config.get("location", "")
         aliases = config["aliases"]
-        first_url = olx_search_url(query, 1)
+        first_url = olx_search_url(query, 1, location)
         print(f"Fetching {city}: {first_url}", file=sys.stderr)
 
         try:
@@ -255,7 +407,7 @@ def collect_olx(max_pages: int, delay: float, strict: bool) -> list[Listing]:
 
         for page in range(2, page_count + 1):
             time.sleep(delay)
-            url = olx_search_url(query, page)
+            url = olx_search_url(query, page, location)
             print(f"Fetching {city} page {page}/{page_count}: {url}", file=sys.stderr)
             try:
                 raw_html = fetch_url(url)
