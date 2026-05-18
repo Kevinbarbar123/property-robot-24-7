@@ -196,13 +196,13 @@ def older_accepted_listings(limit: int = 40) -> list[dict]:
     return listings
 
 
-def recent_phone_listings(limit: int = 80) -> list[dict]:
+def owner_phone_listings(limit: int = 40) -> list[dict]:
     listings: list[dict] = []
     seen_urls: set[str] = set()
     for report in report_files():
         data = load_json(report, {})
         report_time = path_modified_text(report)
-        for item in (data.get("accepted") or []) + (data.get("rejected") or []):
+        for item in data.get("accepted") or []:
             if not str(item.get("phone_number") or "").strip():
                 continue
             url = str(item.get("url") or "")
@@ -296,6 +296,33 @@ def grouped_listing_sections(items: list[dict], badge: str, *, exclude_urls: set
             </section>"""
         )
     return "\n".join(sections)
+
+
+def compact_scan_output(raw_output: str, limit: int = 2600) -> str:
+    if not raw_output:
+        return "No web scan output yet."
+    useful_lines = []
+    for line in raw_output.splitlines():
+        clean = line.strip()
+        if not clean:
+            continue
+        if (
+            clean.startswith("Collected ")
+            or clean.startswith("Scored ")
+            or clean.startswith("Accepted ")
+            or clean.startswith("Checked:")
+            or clean.startswith("Inside target radius:")
+            or clean.startswith("Private-looking")
+            or clean.startswith("Agency/business-like")
+            or clean.startswith("Owner-listing alert")
+            or clean.startswith("New likely-owner")
+            or clean.startswith("No strict owner")
+            or "error" in clean.lower()
+            or "timed out" in clean.lower()
+        ):
+            useful_lines.append(clean)
+    summary = "\n".join(useful_lines[:80]) if useful_lines else raw_output[-limit:]
+    return summary[-limit:]
 
 
 def whatsapp_number(raw_phone: str) -> str:
@@ -492,8 +519,8 @@ def css() -> str:
     return """
     :root {
       color-scheme: light;
-      --page:#f5f1e9;
-      --paper:#fffaf1;
+      --page:#f7f3ea;
+      --paper:#fffdf8;
       --ink:#1d2324;
       --muted:#6f7470;
       --line:rgba(29,35,36,.12);
@@ -507,14 +534,14 @@ def css() -> str:
       margin:0;
       min-height:100vh;
       font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
-      background:radial-gradient(circle at top left,rgba(198,155,91,.28),transparent 34rem),linear-gradient(180deg,#fbf7ef 0%,var(--page) 48%,#eee6d8 100%);
+      background:#f7f3ea;
       color:var(--ink);
     }
     main { width:min(1120px,100%); margin:0 auto; padding:22px 16px 104px; }
     .topbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; padding:10px 4px; }
     .brand { display:flex; align-items:center; gap:12px; font-weight:850; letter-spacing:-.02em; }
     .logo { width:46px; height:46px; display:grid; place-items:center; border-radius:16px; background:var(--accent); color:#fff7e8; box-shadow:0 14px 35px rgba(15,61,53,.18); font-size:20px; }
-    .hero { position:relative; overflow:hidden; display:grid; grid-template-columns:minmax(0,1.05fr) minmax(310px,.95fr); gap:24px; align-items:center; padding:28px; border-radius:34px; background:linear-gradient(135deg,rgba(255,250,241,.96),rgba(240,231,216,.95)); box-shadow:var(--shadow); border:1px solid rgba(255,255,255,.78); }
+    .hero { position:relative; overflow:hidden; display:grid; grid-template-columns:minmax(0,1.05fr) minmax(310px,.95fr); gap:24px; align-items:center; padding:28px; border-radius:34px; background:#fffdf8; box-shadow:var(--shadow); border:1px solid rgba(29,35,36,.08); }
     .hero:after { content:""; position:absolute; width:360px; height:360px; right:-130px; top:-160px; border-radius:50%; background:rgba(198,155,91,.18); pointer-events:none; }
     .hero-copy,.search-panel { position:relative; z-index:1; }
     h1 { margin:10px 0 12px; font-size:clamp(38px,8vw,68px); line-height:.92; letter-spacing:-.07em; }
@@ -527,7 +554,7 @@ def css() -> str:
     button.secondary { color:var(--ink); background:#efe7d9; border:1px solid var(--line); }
     button.search { min-height:92px; font-size:24px; letter-spacing:.02em; background:linear-gradient(135deg,#0f3d35,#174f44); box-shadow:0 20px 48px rgba(15,61,53,.24); }
     button:disabled { opacity:.55; cursor:not-allowed; }
-    .search-panel { padding:18px; border-radius:28px; background:rgba(255,255,255,.58); border:1px solid rgba(255,255,255,.86); box-shadow:inset 0 0 0 1px rgba(29,35,36,.04); backdrop-filter:blur(12px); }
+    .search-panel { padding:18px; border-radius:28px; background:#ffffff; border:1px solid rgba(29,35,36,.08); box-shadow:inset 0 0 0 1px rgba(29,35,36,.04); }
     .actions { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:10px; margin-top:10px; }
     .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; margin-top:16px; }
     .card { background:rgba(255,250,241,.86); border:1px solid rgba(29,35,36,.09); border-radius:26px; padding:18px; box-shadow:0 14px 42px rgba(44,35,24,.08); }
@@ -556,6 +583,8 @@ def css() -> str:
     .area-heading h3 { margin:0; font-size:18px; letter-spacing:-.02em; }
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#211f1b; border-radius:20px; padding:16px; color:#f6ead8; max-height:420px; overflow:auto; border:1px solid rgba(255,255,255,.08); }
     .section-intro { margin-top:0; max-width:760px; }
+    .notice { background:#fff8e8; border:1px solid rgba(198,155,91,.35); border-radius:22px; padding:14px 16px; margin:18px 0; color:#51442f; font-weight:750; }
+    details.card summary { cursor:pointer; font-weight:900; color:var(--accent); }
     .bottom-search { position:fixed; left:0; right:0; bottom:0; padding:10px 14px max(10px,env(safe-area-inset-bottom)); background:linear-gradient(180deg,rgba(245,241,233,0),rgba(245,241,233,.92) 28%,#f5f1e9); backdrop-filter:blur(14px); z-index:20; }
     .bottom-search form { width:min(1120px,100%); margin:0 auto; }
     .bottom-search button { min-height:58px; border-radius:20px; }
@@ -584,6 +613,30 @@ def page_shell(title: str, body: str, *, refresh: bool = False) -> bytes:
 </html>""".encode("utf-8")
 
 
+def error_page(message: str) -> bytes:
+    safe_message = html.escape(message)
+    return page_shell(
+        APP_NAME,
+        f"""
+        <nav class="topbar">
+          <div class="brand"><div class="logo">PR</div><div>Property Robot<br><span class="muted">Safe mode</span></div></div>
+          <span class="pill bad">Temporary issue</span>
+        </nav>
+        <section class="hero">
+          <div class="hero-copy">
+            <span class="eyebrow">Website recovered</span>
+            <h1>Refresh the robot</h1>
+            <p>{safe_message}</p>
+            <p>The site is still online. This safe page appears instead of a blank or black screen if one section fails.</p>
+          </div>
+          <div class="search-panel">
+            <a class="button" href="/">Reload Website</a>
+          </div>
+        </section>
+        """,
+    )
+
+
 def home_page() -> bytes:
     summary = status_summary()
     web_state = summary.get("web") or {}
@@ -592,18 +645,17 @@ def home_page() -> bytes:
     accepted = sorted_listings(report.get("accepted") or [])
     rejected = report.get("rejected") or []
     manual_checks = manual_check_candidates(rejected)
-    older_listings = sorted_listings(older_accepted_listings())
-    phone_listings = sorted_listings(recent_phone_listings())
+    older_listings = sorted_listings(older_accepted_listings(limit=25))
+    phone_listings = sorted_listings(owner_phone_listings())
     latest_urls = {str(item.get("url") or "") for item in accepted}
     report_summary = report.get("summary") or {}
     report_note = report.get("_note", "")
-    output = html.escape(str(web_state.get("last_output") or "No web scan output yet."))
-    cards = grouped_listing_sections(accepted[:60], "Best match") if accepted else "<p class='muted'>No accepted owner listings in the latest report.</p>"
-    manual_cards = grouped_listing_sections(sorted_listings(manual_checks), "Manual check") if manual_checks else "<p class='muted'>No close calls right now. The filter is seeing mostly agency listings.</p>"
+    output = html.escape(compact_scan_output(str(web_state.get("last_output") or "")))
+    cards = grouped_listing_sections(accepted[:30], "Likely owner") if accepted else "<p class='muted'>No confirmed likely-owner listings in the latest report.</p>"
     older_cards = grouped_listing_sections(older_listings, "Older match", exclude_urls=latest_urls)
-    phone_cards = grouped_listing_sections(phone_listings, "Phone found") if phone_listings else "<p class='muted'>No phone numbers found in recent reports yet.</p>"
-    contact_preview = contact_demo_card() if not any(item.get("phone_number") for item in accepted + manual_checks) else ""
-    history_cards = "\n".join(history_card(item) for item in decision_report_history(20))
+    phone_cards = grouped_listing_sections(phone_listings, "Owner phone") if phone_listings else "<p class='muted'>No accepted owner phone numbers found in recent reports yet.</p>"
+    contact_preview = contact_demo_card() if not any(item.get("phone_number") for item in accepted) else ""
+    history_cards = "\n".join(history_card(item) for item in decision_report_history(10))
     search_button_text = "Searching..." if running else "SEARCH NEW LISTINGS NOW"
     search_disabled = "disabled" if running else ""
     status_text = "Live scan" if running else "Ready"
@@ -617,7 +669,7 @@ def home_page() -> bytes:
       <div class="hero-copy">
         <span class="eyebrow">Daily control panel</span>
         <h1>{APP_NAME}</h1>
-        <p>Search fresh owner listings from your iPhone, review older matches, and contact owners faster with a cleaner workflow that does not depend on Telegram.</p>
+        <p>Search fresh likely-owner listings from your iPhone. Agency and broker rows stay out of the main results.</p>
       </div>
       <div class="search-panel">
         <form method="post" action="/scan">
@@ -631,26 +683,25 @@ def home_page() -> bytes:
         </div>
       </div>
     </section>
+    <div class="notice">Owner-only view: the cards below are accepted likely-owner matches. Raw OLX listings, agencies, and rejected rows are not shown as contact leads.</div>
     <section class="grid">
       <div class="card"><div class="metric">{summary['seen_count']}</div><p>Seen listings</p></div>
-      <div class="card"><div class="metric">{report_summary.get('accepted', 0)}</div><p>Accepted latest report</p></div>
-      <div class="card"><div class="metric warn">{len(manual_checks)}</div><p>Worth manual check</p></div>
+      <div class="card"><div class="metric">{report_summary.get('accepted', 0)}</div><p>Latest likely owners</p></div>
+      <div class="card"><div class="metric warn">{report_summary.get('rejected', 0)}</div><p>Rejected agencies / risky rows</p></div>
       <div class="card"><div class="metric">{len(older_listings)}</div><p>Older accepted found</p></div>
-      <div class="card"><div class="metric">{len(phone_listings)}</div><p>Phone numbers found</p></div>
+      <div class="card"><div class="metric">{len(phone_listings)}</div><p>Accepted owner phones</p></div>
       <div class="card"><div class="metric">{summary['queued_telegram_messages']}</div><p>Queued Telegram messages</p></div>
       <div class="card"><div class="metric {'bad' if returncode not in (None, 0, '-') else 'ok'}">{returncode}</div><p>Last web scan code</p></div>
     </section>
     <h2>Latest Owner Matches</h2>
+    <p class="section-intro">Only listings that passed the owner filter appear here. Agencies and broker-style rows are counted as rejected, not shown as leads.</p>
     <div>{cards}</div>
     <h2>Older Owner Listings Found</h2>
     <p class="section-intro">Previously accepted owner-like listings from older scans. Newest historical matches appear first, and duplicates are hidden.</p>
     <div>{older_cards}</div>
-    <h2>Phone Numbers Found</h2>
-    <p class="section-intro">Recent listings where the robot found a phone number, grouped by area and sorted newest upload to oldest. Verify the listing before contacting because this can include agency rows too.</p>
+    <h2>Accepted Owner Phone Numbers</h2>
+    <p class="section-intro">Phone numbers shown here belong only to accepted likely-owner matches. Rejected agency rows are excluded.</p>
     <div>{phone_cards}</div>
-    <h2>Worth Manual Check</h2>
-    <p class="section-intro">These are not strong enough to auto-accept, but they have low owner-risk scores or owner-like wording. Useful when the market is quiet.</p>
-    <div>{manual_cards}</div>
     {"<h2>Contact Preview</h2><p class='muted'>When OLX exposes an owner phone number, the card gets a WhatsApp Business button like this.</p><div class='grid'>" + contact_preview + "</div>" if contact_preview else ""}
     <h2>Scan History</h2>
     <p class="section-intro">Recent scan reports, newest first. Tap a row to open the raw decision log if you want to inspect every accepted/rejected listing.</p>
@@ -662,8 +713,7 @@ def home_page() -> bytes:
       <p>Latest report: <strong>{html.escape(str(report.get('_path', 'none')))}</strong></p>
       {"<p class='warn'>" + html.escape(str(report_note)) + "</p>" if report_note else ""}
     </div>
-    <h2>Last Scan Output</h2>
-    <pre>{output}</pre>
+    <details class="card"><summary>Last Scan Output</summary><pre>{output}</pre></details>
     <div class="bottom-search">
       <form method="post" action="/scan">
         <input type="hidden" name="days" value="0">
@@ -713,7 +763,7 @@ class RobotHandler(BaseHTTPRequestHandler):
             self.send_html(home_page())
         except Exception as exc:
             log_error(f"GET failed path={self.path}", exc)
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Temporary web app error. Try refresh.")
+            self.send_html(error_page("Temporary web app error. Tap reload and try again."))
 
     def do_POST(self) -> None:
         try:
@@ -739,6 +789,7 @@ class RobotHandler(BaseHTTPRequestHandler):
     def send_html(self, content: bytes) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
