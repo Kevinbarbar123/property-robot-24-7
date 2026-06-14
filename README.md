@@ -123,6 +123,10 @@ Facebook Marketplace has no public search API like OLX, so this source drives a 
 
 ### One-time setup
 
+Easiest way (Windows): on a PC with a browser/display (not Railway), double-click `setup_facebook_login.ps1` in this folder (right-click -> "Run with PowerShell"). It installs everything and opens Facebook for you to log into -- see the steps it runs below.
+
+Manual steps, if you'd rather run them yourself:
+
 1. Install dependencies, including the Playwright browser:
 
 ```powershell
