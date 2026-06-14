@@ -13,7 +13,6 @@ import argparse
 import atexit
 import http.client
 import json
-import math
 import os
 import re
 import socket
@@ -22,7 +21,6 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -41,6 +39,28 @@ from property_bot import (
     normalize_text,
     parse_page_count,
 )
+from owner_scoring import (
+    DEFAULT_RADIUS_KM,
+    FANAR_CENTER_LAT,
+    FANAR_CENTER_LNG,
+    SellerDetails,
+    agency_text_found,
+    extract_phone_number_from_description,
+    haversine_km,
+    infer_purpose,
+    is_agency_like,
+    is_facebook_listing,
+    likely_owner,
+    looks_like_reference_code_text,
+    merge_details,
+    normalize_phone_number,
+    preliminary_rejection_reasons,
+)
+
+try:
+    import facebook_marketplace
+except ImportError:
+    facebook_marketplace = None
 
 
 STATE_PATH = Path("data/telegram_owner_alert_state.json")
@@ -57,9 +77,7 @@ DEFAULT_DETAIL_WORKERS = 6
 DEFAULT_MAX_CANDIDATES = 120
 DEFAULT_DETAIL_SCORE_LIMIT = 12
 DEFAULT_HISTORICAL_OWNER_SCORE_THRESHOLD = 5
-FANAR_CENTER_LAT = 33.877799
-FANAR_CENTER_LNG = 35.577951
-DEFAULT_RADIUS_KM = 15.0
+DEFAULT_FACEBOOK_MAX_LISTINGS = 60
 TARGET_AREA_LABEL = "the selected Metn target areas"
 TELEGRAM_API_HOST = "api.telegram.org"
 DEFAULT_TELEGRAM_CONNECT_HOSTS = (
@@ -248,73 +266,6 @@ TARGET_CITY_ALIASES = {
     for city, config in OLX_TARGET_SEARCHES.items()
     for alias in [city, *config["aliases"]]
 }
-
-AGENCY_TERMS = (
-    "agency",
-    "agent",
-    "broker",
-    "real estate",
-    "properties",
-    "property",
-    "group",
-    "development",
-    "developers",
-    "company",
-    "s.a.r.l",
-    "sarl",
-    "estate",
-    "consultancy",
-    "consultants",
-    "c-properties",
-    "confidence",
-    "golden mark",
-    "golden land",
-    "balance real estate",
-    "escwa",
-    "yas real estate",
-)
-
-AGENCY_CODE_PREFIXES = (
-    "gmc",
-    "cprc",
-    "cpcc",
-    "cpes",
-    "cpsk",
-    "rgms",
-    "nkp",
-    "nk",
-    "dy",
-    "mqoa",
-    "sgrm",
-    "dpea",
-    "spm",
-    "rw",
-    "rwr",
-)
-
-ARABIC_DIGIT_TRANSLATION = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
-
-
-@dataclass
-class SellerDetails:
-    listing: Listing
-    seller_id: str = ""
-    seller_name: str = ""
-    phone_number: str = ""
-    account_ads_count: int | None = None
-    seller_type: str = ""
-    agency_name: str = ""
-    agency_id: str = ""
-    agent_code: str = ""
-    ownership: str = ""
-    purpose: str = ""
-    lat: float | None = None
-    lng: float | None = None
-    distance_km: float | None = None
-    description: str = ""
-    owner_score: int = 0
-    exclusion_reasons: tuple[str, ...] = ()
-    from_search_page: bool = False
 
 
 def extract_json_string(raw_html: str, key: str) -> str:
@@ -681,17 +632,6 @@ def extract_description(raw_html: str) -> str:
     return normalize_text(match.group(1)) if match else ""
 
 
-def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    radius = 6371.0
-    d_lat = math.radians(lat2 - lat1)
-    d_lng = math.radians(lng2 - lng1)
-    a = (
-        math.sin(d_lat / 2) ** 2
-        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2
-    )
-    return 2 * radius * math.asin(math.sqrt(a))
-
-
 def extract_geography(raw_html: str) -> tuple[float | None, float | None]:
     geography_match = re.search(r'"geography":\{"lat":(-?\d+(?:\.\d+)?),"lng":(-?\d+(?:\.\d+)?)\}', raw_html)
     if geography_match:
@@ -702,49 +642,6 @@ def extract_geography(raw_html: str) -> tuple[float | None, float | None]:
         # OLX stores geo_point as [lng, lat].
         return float(geo_point_match.group(2)), float(geo_point_match.group(1))
     return None, None
-
-
-def infer_purpose(listing: Listing) -> str:
-    source = listing.source.lower()
-    if "rent" in source:
-        return "rent"
-    if "sale" in source:
-        return "sale"
-    return "unknown"
-
-
-def normalize_phone_number(value: str) -> str:
-    value = value.translate(ARABIC_DIGIT_TRANSLATION)
-    digits = re.sub(r"\D", "", value)
-    if not digits:
-        return ""
-    if digits.startswith("00961"):
-        digits = digits[2:]
-    if digits.startswith("961") and len(digits) >= 10:
-        return f"+{digits}"
-    if digits.startswith("0") and len(digits) >= 8:
-        return f"+961{digits[1:]}"
-    if len(digits) == 7 and digits.startswith("3"):
-        return f"+961{digits}"
-    if len(digits) == 8 and digits[:2] in {"03", "70", "71", "76", "78", "79", "81"}:
-        return f"+961{digits[1:] if digits.startswith('0') else digits}"
-    return ""
-
-
-def extract_phone_number_from_description(description: str) -> str:
-    description = description.translate(ARABIC_DIGIT_TRANSLATION)
-    phone_patterns = [
-        r"(?:\+|00)?961[\s.-]*(?:3|70|71|76|78|79|81)[\s.-]*\d{3}[\s.-]*\d{3}",
-        r"\b0?3[\s.-]*\d{3}[\s.-]*\d{3}\b",
-        r"\b(?:70|71|76|78|79|81)[\s.-]*\d{3}[\s.-]*\d{3}\b",
-    ]
-    for pattern in phone_patterns:
-        match = re.search(pattern, description)
-        if match:
-            phone = normalize_phone_number(match.group(0))
-            if phone:
-                return phone
-    return ""
 
 
 def extract_phone_number(raw_html: str, description: str) -> str:
@@ -815,33 +712,6 @@ def extract_contact_name(raw_html: str) -> str:
         return normalize_text(match.group(1))
 
 
-def agency_text_found(*values: str) -> bool:
-    text = " ".join(value for value in values if value).lower()
-    return any(term in text for term in AGENCY_TERMS)
-
-
-def looks_like_reference_code(details: SellerDetails) -> bool:
-    text = f"{details.listing.title} {details.description}"
-    return bool(re.search(r"\b(?:ref|reference|code)\s*#?\s*[a-z]{1,4}\d{2,}\b", text, re.I))
-
-
-def looks_like_reference_code_text(text: str) -> bool:
-    return bool(re.search(r"\b(?:ref|reference|code)\s*#?\s*[a-z]{1,4}\d{2,}\b", text, re.I))
-
-
-def preliminary_rejection_reasons(listing: Listing) -> tuple[str, ...]:
-    reasons: list[str] = []
-    if not is_apartment_candidate(listing):
-        reasons.append("not apartment-like")
-    if looks_like_reference_code_text(listing.title):
-        reasons.append("real-estate reference code found in title")
-    if re.search(r"\b(?:gmc|cprc|cpcc|cpes|cpsk|rgms|nkp|nk|dy|mqoa|sgrm|dpea|spm|rw|rwr)\w*\d+\w*\b", listing.title, re.I):
-        reasons.append("broker-style code found in title")
-    if agency_text_found(listing.title):
-        reasons.append("agency keyword found in title")
-    return tuple(reasons)
-
-
 def candidate_sort_key(listing: Listing) -> tuple[int, float, int]:
     age = listing_age(listing.created)
     age_hours = age.total_seconds() / 3600 if age is not None else 99999
@@ -853,121 +723,6 @@ def candidate_sort_key(listing: Listing) -> tuple[int, float, int]:
     if not is_apartment_candidate(listing):
         title_penalty += 100
     return (title_penalty, age_hours, listing.price_usd or 0)
-
-
-def agency_like_agent_code(value: str) -> bool:
-    code = re.sub(r"[^a-z0-9]", "", value.lower())
-    if not code or code == "n":
-        return False
-    return any(code.startswith(prefix) and any(char.isdigit() for char in code) for prefix in AGENCY_CODE_PREFIXES)
-
-
-def score_owner_likelihood(
-    details: SellerDetails,
-    seller_post_count: int,
-    phone_post_count: int = 0,
-) -> tuple[int, tuple[str, ...]]:
-    score = 0
-    reasons: list[str] = []
-    seller_type = details.seller_type.lower()
-
-    if not is_apartment_candidate(details.listing):
-        score += 100
-        reasons.append("not apartment-like")
-    if details.distance_km is None:
-        score += 7
-        reasons.append("missing coordinates")
-    elif details.distance_km > DEFAULT_RADIUS_KM:
-        score += 100
-        reasons.append(f"{details.distance_km:.1f}km from Fanar")
-
-    if seller_post_count > 3:
-        score += 8
-        reasons.append(f"seller has {seller_post_count} apartment posts in target areas")
-    elif seller_post_count == 3:
-        score += 1
-        reasons.append("seller has 3 apartment posts in target areas")
-
-    if phone_post_count > 3:
-        score += 8
-        reasons.append(f"phone appears on {phone_post_count} apartment posts in target areas")
-
-    if details.agency_name or details.agency_id:
-        score += 6
-        reasons.append("agency profile present")
-    if details.agent_code:
-        if agency_like_agent_code(details.agent_code):
-            score += 6
-            reasons.append("agency-style reference code present")
-        small_private_account = (
-            not details.agency_name
-            and not details.agency_id
-            and seller_type not in {"2", "business", "agency"}
-            and seller_post_count <= 3
-        )
-        score += 2 if small_private_account else 5
-        reasons.append("agent/reference code present")
-    if agency_text_found(details.seller_name, details.listing.title, details.description):
-        score += 4
-        reasons.append("agency keyword found")
-    if looks_like_reference_code(details):
-        score += 3
-        reasons.append("real-estate reference code found")
-    if seller_type in {"business", "agency", "2"}:
-        score += 1
-        reasons.append(f"declared seller type is {details.seller_type}")
-
-    positive_text = f"{details.seller_name} {details.listing.title} {details.description}".lower()
-    if any(term in positive_text for term in ["owner", "direct owner", "by owner", "private owner"]):
-        score -= 2
-        reasons.append("owner wording found")
-    if details.phone_number:
-        score -= 1
-        reasons.append("phone exposed")
-
-    return score, tuple(reasons)
-
-
-def likely_owner(
-    details: SellerDetails,
-    seller_post_count: int,
-    owner_score_threshold: int,
-    phone_post_count: int = 0,
-) -> tuple[bool, tuple[str, ...]]:
-    score, reasons = score_owner_likelihood(details, seller_post_count, phone_post_count)
-    details.owner_score = score
-    return score <= owner_score_threshold, reasons
-
-
-def merge_details(search_details: SellerDetails, fetched_details: SellerDetails) -> SellerDetails:
-    if fetched_details.exclusion_reasons and not fetched_details.seller_name:
-        search_details.exclusion_reasons = fetched_details.exclusion_reasons
-        return search_details
-
-    return SellerDetails(
-        listing=search_details.listing,
-        seller_id=fetched_details.seller_id or search_details.seller_id,
-        seller_name=fetched_details.seller_name or search_details.seller_name,
-        phone_number=fetched_details.phone_number or search_details.phone_number,
-        account_ads_count=fetched_details.account_ads_count,
-        seller_type=fetched_details.seller_type or search_details.seller_type,
-        agency_name=fetched_details.agency_name or search_details.agency_name,
-        agency_id=fetched_details.agency_id or search_details.agency_id,
-        agent_code=fetched_details.agent_code or search_details.agent_code,
-        ownership=fetched_details.ownership or search_details.ownership,
-        purpose=fetched_details.purpose or search_details.purpose,
-        lat=fetched_details.lat if fetched_details.lat is not None else search_details.lat,
-        lng=fetched_details.lng if fetched_details.lng is not None else search_details.lng,
-        distance_km=(
-            fetched_details.distance_km
-            if fetched_details.distance_km is not None
-            else search_details.distance_km
-        ),
-        description=fetched_details.description or search_details.description,
-        owner_score=search_details.owner_score,
-        exclusion_reasons=search_details.exclusion_reasons,
-        from_search_page=True,
-    )
 
 
 def enrich_listings(listings: list[Listing], workers: int, detail_delay: float) -> list[SellerDetails]:
@@ -1062,6 +817,23 @@ def collect_fanar_radius_seed_details(max_pages: int, delay: float) -> list[Sell
                 all_details.extend(search_page_details(raw_html, area, purpose))
 
     return dedupe_seller_details(all_details)
+
+
+def collect_facebook_seed_details(args: argparse.Namespace) -> list[SellerDetails]:
+    if args.skip_facebook or facebook_marketplace is None:
+        return []
+
+    session_path = args.facebook_session or facebook_marketplace.session_path_from_env()
+    try:
+        return facebook_marketplace.collect_facebook_radius_seed_details(
+            max_listings_per_purpose=args.facebook_max_listings,
+            session_path=session_path,
+        )
+    except facebook_marketplace.FacebookSessionError as exc:
+        print(f"Skipping Facebook Marketplace: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Facebook Marketplace scan failed: {exc}", file=sys.stderr)
+    return []
 
 
 def search_page_details(raw_html: str, area: str, purpose: str) -> list[SellerDetails]:
@@ -1374,7 +1146,8 @@ def format_listing(details: SellerDetails, seller_post_count: int) -> str:
     listing = details.listing
     ratio = money(listing.price_per_sqm) if listing.price_per_sqm is not None else "n/a"
     seller = details.seller_name or "unknown account"
-    phone = details.phone_number or "not shown by OLX"
+    source_label = "Facebook" if is_facebook_listing(listing) else "OLX"
+    phone = details.phone_number or f"not shown by {source_label}"
     distance = f"{details.distance_km:.1f}km from Fanar" if details.distance_km is not None else "distance unknown"
     purpose = details.purpose or infer_purpose(listing)
     return "\n".join(
@@ -1501,6 +1274,7 @@ def decision_row(details: SellerDetails, seller_count: int) -> dict:
         "location": listing.location,
         "created": listing.created,
         "url": listing.url,
+        "source": listing.source,
         "seller_id": details.seller_id,
         "seller_name": details.seller_name,
         "phone_number": details.phone_number,
@@ -1544,23 +1318,6 @@ def build_summary(
         "rejected": len(rejected),
         "agency_like_rejected": agency_like_rejected,
     }
-
-
-def is_agency_like(details: SellerDetails, seller_count: int) -> bool:
-    if seller_count > 3:
-        return True
-    if details.agency_name or details.agency_id:
-        return True
-    if agency_like_agent_code(details.agent_code):
-        return True
-    if details.agent_code and not (
-        seller_count <= 3
-        and details.seller_type.lower() not in {"2", "business", "agency"}
-    ):
-        return True
-    if details.seller_type in {"2", "business", "agency"}:
-        return True
-    return agency_text_found(details.seller_name, details.listing.title, details.description)
 
 
 def private_looking_near_misses(
@@ -1661,6 +1418,7 @@ def run(args: argparse.Namespace) -> int:
     state = load_state(args.state)
     seen_urls = set(state.get("seen_urls", []))
     details_list = collect_fanar_radius_seed_details(max_pages=args.max_pages, delay=args.delay)
+    details_list.extend(collect_facebook_seed_details(args))
     new_details = details_list if args.ignore_seen else [
         details for details in details_list if details.listing.url not in seen_urls
     ]
@@ -1692,6 +1450,7 @@ def run(args: argparse.Namespace) -> int:
         for details in initial_scored
         if details.owner_score <= args.detail_score_limit
         and not preliminary_rejection_reasons(details.listing)
+        and not is_facebook_listing(details.listing)
     ]
     detail_candidates = balanced_detail_candidates(detail_candidates, args.max_candidates)
     print(
@@ -1811,6 +1570,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_OWNER_SCORE_THRESHOLD,
         help="Accept listings with owner-likelihood score at or below this value. Lower is stricter. Default: 4.",
+    )
+    parser.add_argument(
+        "--skip-facebook",
+        action="store_true",
+        help="Skip the Facebook Marketplace scan even if a saved session is available.",
+    )
+    parser.add_argument(
+        "--facebook-max-listings",
+        type=int,
+        default=DEFAULT_FACEBOOK_MAX_LISTINGS,
+        help=f"Facebook Marketplace search results to scan per purpose (rent/sale). Default: {DEFAULT_FACEBOOK_MAX_LISTINGS}.",
+    )
+    parser.add_argument(
+        "--facebook-session",
+        type=Path,
+        default=None,
+        help="Override the saved Facebook session path. Defaults to FACEBOOK_SESSION_PATH or data/facebook_session_state.json.",
     )
     parser.add_argument("--ignore-seen", action="store_true", help="Scan matching listings even if already in state.")
     parser.add_argument("--dry-run", action="store_true", help="Print the Telegram message instead of sending.")

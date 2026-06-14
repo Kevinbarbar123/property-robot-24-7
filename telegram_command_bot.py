@@ -3,7 +3,7 @@
 Crash-resistant Telegram command listener for on-demand property scans.
 
 Commands:
-  /latest  Scan OLX now and send new likely-owner listings.
+  /latest  Scan OLX and Facebook Marketplace now and send new likely-owner listings.
   /last7   Scan listings from the last 7 days.
   /last14  Scan listings from the last 14 days.
   /last21  Scan listings from the last 21 days.
@@ -49,7 +49,7 @@ SCAN_LOCK = threading.Lock()
 
 HELP_TEXT = """Property bot commands:
 
-/latest - scan OLX now and send new likely-owner listings
+/latest - scan OLX and Facebook Marketplace now and send new likely-owner listings
 /last7 - scan the last 7 days and send new likely-owner listings
 /last14 - scan the last 14 days and send new likely-owner listings
 /last21 - scan the last 21 days and send new likely-owner listings
@@ -288,9 +288,9 @@ def run_latest_scan(chat_id: int | str, token: str, created_within_days: int = 0
         save_json(SCAN_STATE_PATH, scan_state)
 
         intro = (
-            f"Scanning OLX for the last {created_within_days} days. This can take up to 30 minutes. You can still send /status while I work."
+            f"Scanning OLX and Facebook Marketplace for the last {created_within_days} days. This can take up to 30 minutes. You can still send /status while I work."
             if created_within_days
-            else "Scanning OLX now. This can take up to 30 minutes. You can still send /status while I work."
+            else "Scanning OLX and Facebook Marketplace now. This can take up to 30 minutes. You can still send /status while I work."
         )
         safe_send_message(token, chat_id, intro)
         env = os.environ.copy()
