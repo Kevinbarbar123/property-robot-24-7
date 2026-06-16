@@ -57,6 +57,39 @@ def handle_shutdown(signum: int, _frame) -> None:
     raise SystemExit(0)
 
 
+def materialize_facebook_session() -> None:
+    """Write the saved Facebook session to disk from a Railway env var.
+
+    Railway volumes can't easily receive an uploaded file, so the one-time
+    session created by facebook_login_setup.py can instead be pasted into a
+    Railway variable:
+
+      FACEBOOK_SESSION_B64   base64 of facebook_session_state.json (preferred)
+      FACEBOOK_SESSION_JSON  raw JSON contents of facebook_session_state.json
+
+    If neither is set, nothing happens and the Facebook scan simply falls back
+    to OLX-only. The file contents are secret, so they are never logged.
+    """
+    raw = os.getenv("FACEBOOK_SESSION_JSON")
+    encoded = os.getenv("FACEBOOK_SESSION_B64")
+    if not raw and not encoded:
+        return
+
+    try:
+        if encoded:
+            import base64
+
+            raw = base64.b64decode(encoded).decode("utf-8")
+        from facebook_marketplace import session_path_from_env
+
+        session_path = session_path_from_env()
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(raw or "", encoding="utf-8")
+        log(f"wrote Facebook session from env to {session_path}")
+    except Exception as exc:  # noqa: BLE001 - never crash startup over this
+        log(f"could not write Facebook session from env: {exc}")
+
+
 def telegram_supervisor() -> None:
     if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
         log("telegram supervisor disabled; TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
@@ -88,6 +121,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    materialize_facebook_session()
     threading.Thread(target=telegram_supervisor, daemon=True).start()
     log(f"starting web app on Railway port={os.getenv('PORT', '8787')}")
     return web_robot_app.main()

@@ -7,7 +7,7 @@ This folder has two tools:
 - `telegram_command_bot.py`: keeps a Telegram command listener running so you can request a fresh scan whenever you want.
 - `web_robot_app.py`: private iPhone-friendly web control panel for running scans without Telegram.
 
-The first source is OLX Lebanon.
+The two sources are OLX Lebanon and Facebook Marketplace (see [Facebook Marketplace Search](#facebook-marketplace-search) below for setup).
 
 ## One-Time Report
 
@@ -103,8 +103,8 @@ Each listing message includes:
 
 - Listing title and city
 - Price, sqm, and USD/sqm
-- OLX account name
-- Phone number from the listing description first, then the current listing's seller profile when OLX exposes it, or `not shown by OLX`
+- OLX/Facebook account name
+- Phone number from the listing description first, then the current listing's seller profile when OLX/Facebook exposes it, or `not shown by OLX`/`not shown by Facebook`
 - Listing link
 
 Other commands:
@@ -116,6 +116,82 @@ Other commands:
 /last14
 /last21
 ```
+
+## Facebook Marketplace Search
+
+Facebook Marketplace has no public search API like OLX, so this source drives a real, logged-in browser session (Playwright) instead. Matched listings are scored with the same owner-likelihood rules as OLX (`owner_scoring.py`), for the same Metn target areas.
+
+### One-time setup
+
+Easiest way (Windows): on a PC with a browser/display (not Railway), double-click `setup_facebook_login.ps1` in this folder (right-click -> "Run with PowerShell"). It installs everything and opens Facebook for you to log into -- see the steps it runs below.
+
+Manual steps, if you'd rather run them yourself:
+
+1. Install dependencies, including the Playwright browser:
+
+```powershell
+pip install -r requirements.txt
+playwright install chromium
+```
+
+2. On a machine with a browser/display (not Railway), create the saved session once:
+
+```powershell
+python .\facebook_login_setup.py
+```
+
+A Chromium window opens at facebook.com. Log into the Facebook account you want the bot to browse Marketplace as, solve any 2FA/checkpoint prompts, then go back to the terminal and press Enter. This saves `data/facebook_session_state.json` (already covered by `.gitignore` -- never commit it; treat it like a password).
+
+3. Optional: if results look wrong, open Marketplace in your own browser, search near Beirut, copy the location segment from the URL, and set it as `FACEBOOK_MARKETPLACE_LOCATION` in `.env`/`.env.private`.
+
+### Running
+
+Once `data/facebook_session_state.json` exists, `telegram_owner_alert.py` automatically scans Facebook Marketplace rent/sale alongside OLX, so `/latest`, `/last7`, `/last14`, `/last21`, and the web app pick it up too. If the session file is missing, the scan silently falls back to OLX only.
+
+Useful flags:
+
+```powershell
+python .\telegram_owner_alert.py --skip-facebook
+python .\telegram_owner_alert.py --facebook-max-listings 100
+python .\telegram_owner_alert.py --facebook-session path\to\session.json
+```
+
+You can also run the Facebook scan standalone for debugging:
+
+```powershell
+python .\facebook_marketplace.py --headed
+```
+
+`--headed` shows the browser window. Facebook frequently changes Marketplace's HTML, so if card or detail extraction stops finding fields, use `--headed` to watch the browser and update the selectors in `facebook_marketplace.py`.
+
+### Scoring differences from OLX
+
+Facebook Marketplace search results do not expose exact coordinates or the same structured agency fields OLX does, so the scan adapts:
+
+- Each matched listing gets the approximate centroid coordinates of its target area (`owner_scoring.TARGET_AREAS`), so distance-from-Fanar scoring still applies.
+- Seller post counts, phone-number reuse, "owner" wording, reference codes, and agency keywords are computed the same way as OLX, from the listing title/description and the seller's Marketplace profile/Page.
+- A seller posting via a Facebook Page is treated like a business/agency; a seller using a personal Marketplace profile is treated like an individual.
+
+### Account risk
+
+This feature browses Marketplace using your personal Facebook account's logged-in session. Facebook may flag or restrict accounts used for automated browsing -- use an account you're comfortable with for this, and keep scan frequency modest.
+
+### Railway
+
+The Dockerfile already installs Playwright + Chromium. To enable Facebook Marketplace on Railway:
+
+1. Run `facebook_login_setup.py` locally to create `data/facebook_session_state.json`.
+2. Get that session onto Railway, using **one** of these:
+   - **Easiest (no volume needed):** turn the file into one line of base64 and paste it into a Railway variable named `FACEBOOK_SESSION_B64`. On startup, `railway_start.py` writes it to `FACEBOOK_SESSION_PATH` automatically. Generate the base64 in PowerShell:
+
+     ```powershell
+     [Convert]::ToBase64String([IO.File]::ReadAllBytes("data\facebook_session_state.json"))
+     ```
+
+     Copy the whole output into the `FACEBOOK_SESSION_B64` Railway variable.
+   - **Or via a volume:** put `facebook_session_state.json` on the Railway volume mounted at `/app/data`, or set `FACEBOOK_SESSION_PATH` to wherever you place it.
+
+The session is equivalent to a Facebook login, so keep the Railway variable private. It is never committed to git.
 
 ## Private iPhone Web App
 

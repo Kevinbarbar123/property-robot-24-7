@@ -338,12 +338,17 @@ def whatsapp_number(raw_phone: str) -> str:
     return digits
 
 
+def listing_source_label(item: dict) -> str:
+    return "Facebook" if str(item.get("source") or "").startswith("Facebook Marketplace") else "OLX"
+
+
 def whatsapp_message(item: dict) -> str:
     title = str(item.get("title") or "your property")
     url = str(item.get("url") or "")
+    source = listing_source_label(item)
     return (
         "Hi sir, I hope you are well. "
-        f"I saw your apartment listing on OLX: {title}. "
+        f"I saw your apartment listing on {source}: {title}. "
         "Would you be open to working with a broker if I have a serious client for it? "
         f"{url}"
     ).strip()
@@ -456,10 +461,11 @@ def listing_card(item: dict, badge: str = "") -> str:
     phone_digits = "+" + wa_number if wa_number.startswith("961") else wa_number
     phone_link = f"<a class='mini' href='tel:{html.escape(phone_digits)}'>Call</a>" if wa_number else ""
     whatsapp_link = f"<a class='mini whatsapp' href='https://wa.me/{html.escape(wa_number)}?text={wa_text}' target='_blank' rel='noreferrer'>WhatsApp Business</a>" if wa_number else ""
+    source = listing_source_label(item)
     contact_html = (
         f"<div class='contact-row'><span class='muted'>Owner number</span><a class='contact-number' href='https://wa.me/{html.escape(wa_number)}?text={wa_text}' target='_blank' rel='noreferrer'>{phone}</a></div>"
         if wa_number
-        else "<div class='contact-row'><span class='muted'>Owner number not shown by OLX yet. Open OLX to check the listing.</span></div>"
+        else f"<div class='contact-row'><span class='muted'>Owner number not shown by {source} yet. Open {source} to check the listing.</span></div>"
     )
     badge_html = f"<span class='pill'>{html.escape(badge)}</span>" if badge else ""
     return f"""<article class="card listing">
@@ -469,7 +475,7 @@ def listing_card(item: dict, badge: str = "") -> str:
       {contact_html}
       {reason_html}
       <div class="listing-actions">
-        <a class="mini primary" href="{url}" target="_blank" rel="noreferrer">Open OLX</a>
+        <a class="mini primary" href="{url}" target="_blank" rel="noreferrer">Open {source}</a>
         {phone_link}
         {whatsapp_link}
       </div>
@@ -683,7 +689,7 @@ def home_page() -> bytes:
         </div>
       </div>
     </section>
-    <div class="notice">Owner-only view: the cards below are accepted likely-owner matches. Raw OLX listings, agencies, and rejected rows are not shown as contact leads.</div>
+    <div class="notice">Owner-only view: the cards below are accepted likely-owner matches. Raw OLX/Facebook listings, agencies, and rejected rows are not shown as contact leads.</div>
     <section class="grid">
       <div class="card"><div class="metric">{summary['seen_count']}</div><p>Seen listings</p></div>
       <div class="card"><div class="metric">{report_summary.get('accepted', 0)}</div><p>Latest likely owners</p></div>
@@ -702,7 +708,7 @@ def home_page() -> bytes:
     <h2>Accepted Owner Phone Numbers</h2>
     <p class="section-intro">Phone numbers shown here belong only to accepted likely-owner matches. Rejected agency rows are excluded.</p>
     <div>{phone_cards}</div>
-    {"<h2>Contact Preview</h2><p class='muted'>When OLX exposes an owner phone number, the card gets a WhatsApp Business button like this.</p><div class='grid'>" + contact_preview + "</div>" if contact_preview else ""}
+    {"<h2>Contact Preview</h2><p class='muted'>When OLX or Facebook Marketplace exposes an owner phone number, the card gets a WhatsApp Business button like this.</p><div class='grid'>" + contact_preview + "</div>" if contact_preview else ""}
     <h2>Scan History</h2>
     <p class="section-intro">Recent scan reports, newest first. Tap a row to open the raw decision log if you want to inspect every accepted/rejected listing.</p>
     <div class="history-list">{history_cards or "<p class='muted'>No scan history yet.</p>"}</div>

@@ -1,1 +1,6 @@
-# The current Property Robot uses only the Python standard library.
+# Core Property Robot uses only the Python standard library.
+#
+# Facebook Marketplace search (facebook_marketplace.py, facebook_login_setup.py)
+# additionally needs Playwright, with its Chromium browser installed via:
+#   playwright install --with-deps chromium
+playwright
