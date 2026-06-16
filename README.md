@@ -181,7 +181,17 @@ This feature browses Marketplace using your personal Facebook account's logged-i
 The Dockerfile already installs Playwright + Chromium. To enable Facebook Marketplace on Railway:
 
 1. Run `facebook_login_setup.py` locally to create `data/facebook_session_state.json`.
-2. Put that file on the same Railway volume used for seen-listing state (mounted at `/app/data`), or set `FACEBOOK_SESSION_PATH` to wherever you place it.
+2. Get that session onto Railway, using **one** of these:
+   - **Easiest (no volume needed):** turn the file into one line of base64 and paste it into a Railway variable named `FACEBOOK_SESSION_B64`. On startup, `railway_start.py` writes it to `FACEBOOK_SESSION_PATH` automatically. Generate the base64 in PowerShell:
+
+     ```powershell
+     [Convert]::ToBase64String([IO.File]::ReadAllBytes("data\facebook_session_state.json"))
+     ```
+
+     Copy the whole output into the `FACEBOOK_SESSION_B64` Railway variable.
+   - **Or via a volume:** put `facebook_session_state.json` on the Railway volume mounted at `/app/data`, or set `FACEBOOK_SESSION_PATH` to wherever you place it.
+
+The session is equivalent to a Facebook login, so keep the Railway variable private. It is never committed to git.
 
 ## Private iPhone Web App
 
