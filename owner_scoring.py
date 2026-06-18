@@ -255,6 +255,7 @@ def score_owner_likelihood(
     score = 0
     reasons: list[str] = []
     seller_type = details.seller_type.lower()
+    facebook = is_facebook_listing(details.listing)
 
     if not is_apartment_candidate(details.listing):
         score += 100
@@ -266,7 +267,16 @@ def score_owner_likelihood(
         score += 100
         reasons.append(f"{details.distance_km:.1f}km from Fanar")
 
-    if seller_post_count > 3:
+    # Facebook never exposes OLX's structured agency_id/agent_code fields, so
+    # a broker posting from a personal profile looks identical to a real
+    # individual on every signal below except repeat posts. Catch those
+    # earlier than OLX needs to, since Facebook scans sample far fewer
+    # listings per run, so even 2 posts from the same seller is meaningful.
+    if facebook:
+        if seller_post_count > 1:
+            score += 8
+            reasons.append(f"seller has {seller_post_count} apartment posts in target areas")
+    elif seller_post_count > 3:
         score += 8
         reasons.append(f"seller has {seller_post_count} apartment posts in target areas")
     elif seller_post_count == 3:
@@ -299,11 +309,17 @@ def score_owner_likelihood(
         score += 3
         reasons.append("real-estate reference code found")
     if seller_type in {"business", "agency", "2"}:
-        score += 1
+        # On Facebook, posting from a business Page (vs. a personal profile)
+        # is the only hard-to-fake structural signal left, equivalent to
+        # OLX's "agency profile present" -- so it gets the same weight.
+        score += 6 if facebook else 1
         reasons.append(f"declared seller type is {details.seller_type}")
 
     positive_text = f"{details.seller_name} {details.listing.title} {details.description}".lower()
-    if any(term in positive_text for term in ["owner", "direct owner", "by owner", "private owner"]):
+    # "Owner direct, no agency" is a known broker disguise, and Facebook has
+    # no structural field to cross-check it against (unlike OLX's declared
+    # seller type), so this credit only applies to OLX.
+    if not facebook and any(term in positive_text for term in ["owner", "direct owner", "by owner", "private owner"]):
         score -= 2
         reasons.append("owner wording found")
     if details.phone_number:
