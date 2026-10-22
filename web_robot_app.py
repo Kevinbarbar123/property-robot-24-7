@@ -21,12 +21,14 @@ import sys
 import threading
 import time
 import traceback
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from telegram_owner_alert import STATE_PATH, load_env_files
+from cloud_runtime import active, website_url
 
 
 HOST = "0.0.0.0"
@@ -39,7 +41,6 @@ REPORTS_DIR = Path("reports")
 ALERT_SCRIPT = Path(__file__).with_name("telegram_owner_alert.py")
 SCAN_LOCK = threading.Lock()
 WEB_ERROR_LOG_PATH = Path("logs/web_robot_app.crash.log")
-
 
 def log_error(message: str, exc: BaseException | None = None) -> None:
     try:
@@ -144,16 +145,25 @@ def latest_decision_report() -> dict:
     reports = report_files()
     if not reports:
         return {}
-    fallback: dict = {}
-    for report in reports:
-        data = decorate_report(report, load_json(report, {}))
-        if not fallback:
-            fallback = data
-        if data.get("accepted") or data.get("rejected"):
-            if report != reports[0]:
-                data["_note"] = "Newest scan had no new listings, so this shows the last useful report."
-            return data
-    return fallback
+    data = decorate_report(reports[0], load_json(reports[0], {}))
+    if not data.get("accepted"):
+        data["_note"] = "This newest scan has no new accepted owner listings. Older listings stay saved in Scan History only."
+    return data
+
+
+def accepted_history_count() -> int:
+    seen_urls: set[str] = set()
+    count = 0
+    for report in report_files():
+        data = load_json(report, {})
+        for item in data.get("accepted") or []:
+            url = str(item.get("url") or "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            count += 1
+    return count
 
 
 def decision_report_history(limit: int = 20) -> list[dict]:
@@ -161,18 +171,22 @@ def decision_report_history(limit: int = 20) -> list[dict]:
     for report in report_files()[:limit]:
         data = load_json(report, {})
         summary = data.get("summary") or {}
+        accepted_rows = data.get("accepted") or []
+        newest_row = min((published_sort_value(item) for item in accepted_rows), default=None)
         history.append(
             {
                 "name": report.name,
                 "modified": path_modified_text(report),
-                "accepted": summary.get("accepted", len(data.get("accepted") or [])),
+                "accepted": summary.get("accepted", len(accepted_rows)),
                 "rejected": summary.get("rejected", len(data.get("rejected") or [])),
+                "phones": sum(1 for item in accepted_rows if str(item.get("phone_number") or "").strip()),
+                "newest_sort": newest_row,
                 "new_listings": summary.get("new_listings", summary.get("collected_after_filters", 0)),
                 "detail_checked": summary.get("detail_checked", 0),
                 "useful": bool(data.get("accepted") or data.get("rejected")),
             }
         )
-    return history
+    return sorted(history, key=lambda item: (item.get("newest_sort") is None, item.get("newest_sort") or 10**12))[:limit]
 
 
 def older_accepted_listings(limit: int = 40) -> list[dict]:
@@ -191,9 +205,7 @@ def older_accepted_listings(limit: int = 40) -> list[dict]:
             enriched["_report_name"] = report.name
             enriched["_report_time"] = report_time
             listings.append(enriched)
-            if len(listings) >= limit:
-                return listings
-    return listings
+    return sorted_latest_listings(listings)[:limit]
 
 
 def owner_phone_listings(limit: int = 40) -> list[dict]:
@@ -214,9 +226,12 @@ def owner_phone_listings(limit: int = 40) -> list[dict]:
             enriched["_report_name"] = report.name
             enriched["_report_time"] = report_time
             listings.append(enriched)
-            if len(listings) >= limit:
-                return listings
-    return listings
+    return sorted_latest_listings(listings)[:limit]
+
+
+def owner_phone_listings_from_items(items: list[dict], limit: int = 40) -> list[dict]:
+    phone_items = [item for item in items if str(item.get("phone_number") or "").strip()]
+    return sorted_latest_listings(phone_items)[:limit]
 
 
 def manual_check_candidates(rejected: list[dict], limit: int = 8) -> list[dict]:
@@ -231,6 +246,22 @@ def manual_check_candidates(rejected: list[dict], limit: int = 8) -> list[dict]:
             candidates.append(item)
     candidates.sort(key=lambda item: (item.get("owner_score", 99), -(item.get("price_usd") or 0)))
     return candidates[:limit]
+
+
+def published_sort_value(item: dict) -> float:
+    value = item.get("published_timestamp")
+    try:
+        if value not in {None, ""}:
+            return -float(value)
+    except (TypeError, ValueError):
+        pass
+    published_at = str(item.get("published_at") or "").strip()
+    if published_at:
+        try:
+            return -datetime.fromisoformat(published_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return float(listing_age_seconds(item))
 
 
 def listing_age_seconds(item: dict) -> int:
@@ -257,20 +288,30 @@ def listing_age_seconds(item: dict) -> int:
     return amount * multipliers.get(unit, 10**9)
 
 
-def listing_sort_key(item: dict) -> tuple[str, int, str]:
+def listing_sort_key(item: dict) -> tuple[str, float, str]:
     return (
         str(item.get("city") or "Unknown").lower(),
-        listing_age_seconds(item),
+        published_sort_value(item),
         str(item.get("title") or "").lower(),
     )
 
 
-def newest_sort_key(item: dict) -> tuple[int, str]:
-    return (listing_age_seconds(item), str(item.get("title") or "").lower())
+def newest_sort_key(item: dict) -> tuple[float, str]:
+    return (published_sort_value(item), str(item.get("title") or "").lower())
+
+
+def city_newest_sort_key(city_items: tuple[str, list[dict]]) -> tuple[float, str]:
+    city, items = city_items
+    newest = min((published_sort_value(item) for item in items), default=10**12)
+    return (newest, city.lower())
 
 
 def sorted_listings(items: list[dict]) -> list[dict]:
     return sorted(items, key=listing_sort_key)
+
+
+def sorted_latest_listings(items: list[dict]) -> list[dict]:
+    return sorted(items, key=newest_sort_key)
 
 
 def grouped_listing_sections(items: list[dict], badge: str, *, exclude_urls: set[str] | None = None) -> str:
@@ -285,8 +326,8 @@ def grouped_listing_sections(items: list[dict], badge: str, *, exclude_urls: set
         return "<p class='muted'>No listings found in this section yet.</p>"
 
     sections: list[str] = []
-    for city in sorted(groups):
-        city_items = sorted(groups[city], key=newest_sort_key)
+    for city, group_items in sorted(groups.items(), key=city_newest_sort_key):
+        city_items = sorted(group_items, key=newest_sort_key)
         count = len(city_items)
         cards = "\n".join(listing_card(item, badge) for item in city_items)
         sections.append(
@@ -338,20 +379,19 @@ def whatsapp_number(raw_phone: str) -> str:
     return digits
 
 
-def listing_source_label(item: dict) -> str:
-    return "Facebook" if str(item.get("source") or "").startswith("Facebook Marketplace") else "OLX"
-
-
 def whatsapp_message(item: dict) -> str:
     title = str(item.get("title") or "your property")
     url = str(item.get("url") or "")
-    source = listing_source_label(item)
     return (
         "Hi sir, I hope you are well. "
-        f"I saw your apartment listing on {source}: {title}. "
+        f"I saw your apartment listing on OLX: {title}. "
         "Would you be open to working with a broker if I have a serious client for it? "
         f"{url}"
     ).strip()
+
+
+def confidence_label(item: dict) -> str:
+    return str(item.get("confidence") or ("HIGH OWNER" if item.get("owner_score") == 0 else "LIKELY OWNER"))
 
 
 def safe_int(value, default: int = 0) -> int:
@@ -362,7 +402,7 @@ def safe_int(value, default: int = 0) -> int:
 
 
 def start_scan(created_within_days: int) -> bool:
-    if SCAN_LOCK.locked():
+    if not active() or SCAN_LOCK.locked():
         return False
     created_within_days = max(0, min(created_within_days, 31))
     thread = threading.Thread(target=run_scan, args=(created_within_days,), daemon=True)
@@ -453,29 +493,36 @@ def listing_card(item: dict, badge: str = "") -> str:
     seller = html.escape(str(item.get("seller_name") or "unknown seller"))
     score = html.escape(str(item.get("owner_score", "n/a")))
     created = html.escape(str(item.get("created") or item.get("_report_time") or "unknown age"))
+    published_at = str(item.get("published_at") or "").strip()
+    published_text = ""
+    if published_at:
+        published_text = " Â· published " + html.escape(published_at.replace("T", " ")[:16])
     purpose = html.escape(str(item.get("purpose") or "listing"))
     reasons = ", ".join(str(reason) for reason in (item.get("exclusion_reasons") or [])[:3])
-    reason_html = f"<div class='reason'>Why: {html.escape(reasons)}</div>" if reasons else ""
+    why_sent = ", ".join(str(reason) for reason in (item.get("why_sent") or [])[:4])
+    reason_html = f"<div class='reason'>Why sent: {html.escape(why_sent)}</div>" if why_sent else ""
+    if not reason_html and reasons:
+        reason_html = f"<div class='reason'>Warnings: {html.escape(reasons)}</div>"
     wa_number = whatsapp_number(raw_phone)
     wa_text = quote(whatsapp_message(item))
     phone_digits = "+" + wa_number if wa_number.startswith("961") else wa_number
     phone_link = f"<a class='mini' href='tel:{html.escape(phone_digits)}'>Call</a>" if wa_number else ""
     whatsapp_link = f"<a class='mini whatsapp' href='https://wa.me/{html.escape(wa_number)}?text={wa_text}' target='_blank' rel='noreferrer'>WhatsApp Business</a>" if wa_number else ""
-    source = listing_source_label(item)
     contact_html = (
         f"<div class='contact-row'><span class='muted'>Owner number</span><a class='contact-number' href='https://wa.me/{html.escape(wa_number)}?text={wa_text}' target='_blank' rel='noreferrer'>{phone}</a></div>"
         if wa_number
-        else f"<div class='contact-row'><span class='muted'>Owner number not shown by {source} yet. Open {source} to check the listing.</span></div>"
+        else "<div class='contact-row'><span class='muted'>Owner number not shown by OLX yet. Open OLX to check the listing.</span></div>"
     )
-    badge_html = f"<span class='pill'>{html.escape(badge)}</span>" if badge else ""
+    badge_text = f"{badge} · {confidence_label(item)}" if badge else confidence_label(item)
+    badge_html = f"<span class='pill'>{html.escape(badge_text)}</span>"
     return f"""<article class="card listing">
       <div>{badge_html}<strong>{title}</strong>
-      <span class="muted">{city} - {purpose} - {price} - {created}</span><br>
+      <span class="muted">{city} - {purpose} - {price} - {created}{published_text}</span><br>
       <span class="muted">{seller} - {phone} - score {score}</span></div>
       {contact_html}
       {reason_html}
       <div class="listing-actions">
-        <a class="mini primary" href="{url}" target="_blank" rel="noreferrer">Open {source}</a>
+        <a class="mini primary" href="{url}" target="_blank" rel="noreferrer">Open OLX</a>
         {phone_link}
         {whatsapp_link}
       </div>
@@ -507,6 +554,7 @@ def history_card(item: dict) -> str:
     rejected = html.escape(str(item.get("rejected", 0)))
     new_listings = html.escape(str(item.get("new_listings", 0)))
     detail_checked = html.escape(str(item.get("detail_checked", 0)))
+    phones = html.escape(str(item.get("phones", 0)))
     useful = "Useful" if item.get("useful") else "Empty"
     useful_class = "ok" if item.get("useful") else "muted"
     return f"""<a class="card history-item" href="/reports/{name}" target="_blank" rel="noreferrer">
@@ -514,6 +562,7 @@ def history_card(item: dict) -> str:
       <div class="history-counts">
         <span class="chip {useful_class}">{useful}</span>
         <span class="chip">{accepted} accepted</span>
+        <span class="chip">{phones} phones</span>
         <span class="chip">{rejected} rejected</span>
         <span class="chip">{new_listings} new</span>
         <span class="chip">{detail_checked} opened</span>
@@ -590,6 +639,8 @@ def css() -> str:
     pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#211f1b; border-radius:20px; padding:16px; color:#f6ead8; max-height:420px; overflow:auto; border:1px solid rgba(255,255,255,.08); }
     .section-intro { margin-top:0; max-width:760px; }
     .notice { background:#fff8e8; border:1px solid rgba(198,155,91,.35); border-radius:22px; padding:14px 16px; margin:18px 0; color:#51442f; font-weight:750; }
+    .quick-nav { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:16px 0 4px; }
+    .quick-nav a { padding:12px 13px; border-radius:16px; background:#fffdf8; color:var(--accent); text-decoration:none; font-weight:850; border:1px solid var(--line); box-shadow:0 8px 26px rgba(44,35,24,.06); }
     details.card summary { cursor:pointer; font-weight:900; color:var(--accent); }
     .bottom-search { position:fixed; left:0; right:0; bottom:0; padding:10px 14px max(10px,env(safe-area-inset-bottom)); background:linear-gradient(180deg,rgba(245,241,233,0),rgba(245,241,233,.92) 28%,#f5f1e9); backdrop-filter:blur(14px); z-index:20; }
     .bottom-search form { width:min(1120px,100%); margin:0 auto; }
@@ -648,18 +699,17 @@ def home_page() -> bytes:
     web_state = summary.get("web") or {}
     running = bool(web_state.get("running")) or SCAN_LOCK.locked()
     report = latest_decision_report()
-    accepted = sorted_listings(report.get("accepted") or [])
+    accepted = sorted_latest_listings(report.get("accepted") or [])
     rejected = report.get("rejected") or []
     manual_checks = manual_check_candidates(rejected)
-    older_listings = sorted_listings(older_accepted_listings(limit=25))
-    phone_listings = sorted_listings(owner_phone_listings())
-    latest_urls = {str(item.get("url") or "") for item in accepted}
+    archive_count = accepted_history_count()
+    phone_listings = owner_phone_listings_from_items(accepted)
     report_summary = report.get("summary") or {}
     report_note = report.get("_note", "")
     output = html.escape(compact_scan_output(str(web_state.get("last_output") or "")))
-    cards = grouped_listing_sections(accepted[:30], "Likely owner") if accepted else "<p class='muted'>No confirmed likely-owner listings in the latest report.</p>"
-    older_cards = grouped_listing_sections(older_listings, "Older match", exclude_urls=latest_urls)
-    phone_cards = grouped_listing_sections(phone_listings, "Owner phone") if phone_listings else "<p class='muted'>No accepted owner phone numbers found in recent reports yet.</p>"
+    latest_timeline_cards = "\n".join(listing_card(item, "Newest") for item in accepted[:18])
+    cards = grouped_listing_sections(accepted[:36], "Likely owner") if accepted else "<p class='muted'>No confirmed likely-owner listings in the latest report.</p>"
+    phone_cards = grouped_listing_sections(phone_listings, "Owner phone") if phone_listings else "<p class='muted'>No accepted owner phone numbers found in this new scan yet.</p>"
     contact_preview = contact_demo_card() if not any(item.get("phone_number") for item in accepted) else ""
     history_cards = "\n".join(history_card(item) for item in decision_report_history(10))
     search_button_text = "Searching..." if running else "SEARCH NEW LISTINGS NOW"
@@ -675,42 +725,46 @@ def home_page() -> bytes:
       <div class="hero-copy">
         <span class="eyebrow">Daily control panel</span>
         <h1>{APP_NAME}</h1>
-        <p>Search fresh likely-owner listings from your iPhone. Agency and broker rows stay out of the main results.</p>
+        <p>Search fresh likely-owner apartments from your iPhone. The robot opens private-looking OLX pages to pull hidden phone numbers, then shows apartments newest published first.</p>
       </div>
       <div class="search-panel">
         <form method="post" action="/scan">
           <input type="hidden" name="days" value="0">
           <button class="search" type="submit" {search_disabled}>{search_button_text}</button>
         </form>
-        <p class="hint">Best daily button: searches only new unseen listings, then marks them as seen so you do not review the same homes forever.</p>
-        <div class="actions">
+        <p class="hint">Best daily button: searches only new unseen listings, opens the likely owner pages for hidden numbers, then saves history so you do not review the same homes forever.</p>        <div class="actions">
           <form method="post" action="/scan"><input type="hidden" name="days" value="7"><button class="secondary" type="submit" {search_disabled}>Search Last 7 Days</button></form>
           <form method="post" action="/scan"><input type="hidden" name="days" value="14"><button class="secondary" type="submit" {search_disabled}>Search Last 14 Days</button></form>
         </div>
       </div>
     </section>
-    <div class="notice">Owner-only view: the cards below are accepted likely-owner matches. Raw OLX/Facebook listings, agencies, and rejected rows are not shown as contact leads.</div>
+    <div class="notice">New-only mode: the main cards show only listings from the latest scan. Old apartments are not repeated here; they stay saved in Scan History and in your previous Telegram conversation.</div>
+    <nav class="quick-nav" aria-label="Website sections">
+      <a href="#latest">Newest Apartments</a>
+      <a href="#areas">By Area</a>
+      <a href="#phones">Owner Phones</a>
+      <a href="#history">History</a>
+    </nav>
     <section class="grid">
       <div class="card"><div class="metric">{summary['seen_count']}</div><p>Seen listings</p></div>
       <div class="card"><div class="metric">{report_summary.get('accepted', 0)}</div><p>Latest likely owners</p></div>
       <div class="card"><div class="metric warn">{report_summary.get('rejected', 0)}</div><p>Rejected agencies / risky rows</p></div>
-      <div class="card"><div class="metric">{len(older_listings)}</div><p>Older accepted found</p></div>
-      <div class="card"><div class="metric">{len(phone_listings)}</div><p>Accepted owner phones</p></div>
+      <div class="card"><div class="metric">{archive_count}</div><p>Total saved in history</p></div>
+      <div class="card"><div class="metric">{len(phone_listings)}</div><p>New owner phones</p></div>
       <div class="card"><div class="metric">{summary['queued_telegram_messages']}</div><p>Queued Telegram messages</p></div>
       <div class="card"><div class="metric {'bad' if returncode not in (None, 0, '-') else 'ok'}">{returncode}</div><p>Last web scan code</p></div>
-    </section>
-    <h2>Latest Owner Matches</h2>
-    <p class="section-intro">Only listings that passed the owner filter appear here. Agencies and broker-style rows are counted as rejected, not shown as leads.</p>
+    </section>    <h2 id="latest">Latest Apartments Timeline</h2>
+    <p class="section-intro">Newest published owner-like apartments first, across all target areas.</p>
+    <div class="grid">{latest_timeline_cards or "<p class='muted'>No confirmed likely-owner listings in the latest report.</p>"}</div>
+    <h2 id="areas">Listings By Area</h2>
+    <p class="section-intro">Same accepted owner matches grouped by area. Inside every area, cards stay newest to oldest.</p>
     <div>{cards}</div>
-    <h2>Older Owner Listings Found</h2>
-    <p class="section-intro">Previously accepted owner-like listings from older scans. Newest historical matches appear first, and duplicates are hidden.</p>
-    <div>{older_cards}</div>
-    <h2>Accepted Owner Phone Numbers</h2>
-    <p class="section-intro">Phone numbers shown here belong only to accepted likely-owner matches. Rejected agency rows are excluded.</p>
+    <h2 id="phones">Accepted Owner Phone Numbers</h2>
+    <p class="section-intro">Phone numbers shown here belong only to new accepted matches from the latest scan. Rejected agency rows and old saved rows are excluded.</p>
     <div>{phone_cards}</div>
-    {"<h2>Contact Preview</h2><p class='muted'>When OLX or Facebook Marketplace exposes an owner phone number, the card gets a WhatsApp Business button like this.</p><div class='grid'>" + contact_preview + "</div>" if contact_preview else ""}
-    <h2>Scan History</h2>
-    <p class="section-intro">Recent scan reports, newest first. Tap a row to open the raw decision log if you want to inspect every accepted/rejected listing.</p>
+    {"<h2>Contact Preview</h2><p class='muted'>When OLX exposes an owner phone number, the card gets a WhatsApp Business button like this.</p><div class='grid'>" + contact_preview + "</div>" if contact_preview else ""}
+    <h2 id="history">Scan History</h2>
+    <p class="section-intro">Old apartment matches stay here instead of repeating in the new-results sections. Tap a row to open that old scan report.</p>
     <div class="history-list">{history_cards or "<p class='muted'>No scan history yet.</p>"}</div>
     <h2>System Status</h2>
     <div class="card">
@@ -737,8 +791,14 @@ class RobotServer(ThreadingHTTPServer):
 
 class RobotHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        from recovery_portal import dispatch
+        if active() and dispatch(self, urlparse(self.path).path, "GET"):
+            return
         try:
             parsed = urlparse(self.path)
+            if parsed.path == "/healthz":
+                self.send_json({"status": "ok", "mode": "active" if active() else "staging"})
+                return
             if parsed.path == "/manifest.json":
                 self.send_json(
                     {
@@ -772,8 +832,14 @@ class RobotHandler(BaseHTTPRequestHandler):
             self.send_html(error_page("Temporary web app error. Tap reload and try again."))
 
     def do_POST(self) -> None:
+        from recovery_portal import dispatch
+        if active() and dispatch(self, urlparse(self.path).path, "POST"):
+            return
         try:
             parsed = urlparse(self.path)
+            if not active():
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Cloud staging: scans are disabled until migration and cutover.")
+                return
             fields = self.read_form()
             if parsed.path == "/scan":
                 days = safe_int(fields.get("days", ["0"])[0], 0)
@@ -838,20 +904,33 @@ class RobotHandler(BaseHTTPRequestHandler):
 def main() -> int:
     load_env_files()
     server = RobotServer((HOST, PORT), RobotHandler)
+    from browser_recovery import register_service
+    import recovery
+    if active():
+        register_service(server.server_address[1])
+    recovery_stop = threading.Event()
+    if active():
+        threading.Thread(target=recovery.recovery_loop, args=(recovery_stop,), daemon=True).start()
     lan_url = f"http://{local_ip_address()}:{PORT}/"
     print(f"{APP_NAME} is running.")
     print(f"Open on this PC: http://127.0.0.1:{PORT}/")
     print(f"Open on iPhone:  {lan_url}")
-    print("No PIN is required. Keep this window running. In Safari: Share -> Add to Home Screen.")
+    print(f"Public website: {website_url()}")
+    print("No PIN is required. In Safari: Share -> Add to Home Screen.")
     try:
         server.serve_forever()
     except Exception as exc:
         log_error("Web server stopped unexpectedly", exc)
         raise
     finally:
+        recovery_stop.set()
+        from browser_recovery import SERVICE
+        if SERVICE:
+            SERVICE.stop()
         server.server_close()
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

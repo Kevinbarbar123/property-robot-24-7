@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "request_interval_min": 1.0,
+  "request_interval_max": 2.0,
+  "max_in_flight": 2,
+  "max_attempts": 3,
+  "backoff_base": 2.0,
+  "backoff_cap": 60.0,
+  "restriction_cooldown": 21600,
+  "rate_limit_cooldown": 900,
+  "temporary_cooldown": 300,
+  "detail_cache_seconds": 21600,
+  "verification_idle_seconds": 900,
+  "verification_max_seconds": 3600,
+  "browser_channel": "chrome",
+  "next_data_selector": "script#__NEXT_DATA__",
+  "search_state_paths": ["props.pageProps.initialState", "props.initialState"],
+  "challenge_selectors": ["iframe[src*='recaptcha']", ".g-recaptcha", "iframe[src*='hcaptcha']", ".h-captcha", ".cf-turnstile", "iframe[src*='challenges.cloudflare.com']"],
+  "challenge_phrases": ["verify you are human", "verify that you are human", "complete the captcha", "checking your browser", "performing security verification", "enable javascript and cookies to continue"]
+}

@@ -1,0 +1,34 @@
+target_areas:
+  - Fanar
+  - Mar Roukoz
+  - Ain Saadeh
+  - Jdeideh
+  - Bsalim
+  - Beit Mery
+  - Beit Merry
+  - Mansourieh
+  - Nabay
+  - Antelias
+  - Qornet Chehwen
+  - Kornet Chehwan
+  - Metn
+property_types:
+  - apartment_sale
+  - apartment_rent
+  - villa_sale
+  - villa_rent
+  - land_sale
+min_price: 1
+max_price: 10000000
+owner_score_threshold: 70
+scrape_interval_minutes: 60
+max_pages_per_run: 3
+max_detail_pages_per_run: 160
+request_delay_min_seconds: 0.8
+request_delay_max_seconds: 2.2
+cache_ttl_hours: 6
+database_path: data/pro_owner_leads.sqlite
+csv_export_path: reports/pro_owner_leads.csv
+json_export_path: reports/pro_owner_leads.json
+telegram_bot_token: ${TELEGRAM_BOT_TOKEN}
+telegram_chat_id: ${TELEGRAM_CHAT_ID}

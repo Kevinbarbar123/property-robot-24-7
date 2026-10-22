@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import web_robot_app
+from cloud_runtime import active, enabled, prepare_runtime
 
 
 ROOT = Path(__file__).resolve().parent
@@ -57,40 +58,10 @@ def handle_shutdown(signum: int, _frame) -> None:
     raise SystemExit(0)
 
 
-def materialize_facebook_session() -> None:
-    """Write the saved Facebook session to disk from a Railway env var.
-
-    Railway volumes can't easily receive an uploaded file, so the one-time
-    session created by facebook_login_setup.py can instead be pasted into a
-    Railway variable:
-
-      FACEBOOK_SESSION_B64   base64 of facebook_session_state.json (preferred)
-      FACEBOOK_SESSION_JSON  raw JSON contents of facebook_session_state.json
-
-    If neither is set, nothing happens and the Facebook scan simply falls back
-    to OLX-only. The file contents are secret, so they are never logged.
-    """
-    raw = os.getenv("FACEBOOK_SESSION_JSON")
-    encoded = os.getenv("FACEBOOK_SESSION_B64")
-    if not raw and not encoded:
-        return
-
-    try:
-        if encoded:
-            import base64
-
-            raw = base64.b64decode(encoded).decode("utf-8")
-        from facebook_marketplace import session_path_from_env
-
-        session_path = session_path_from_env()
-        session_path.parent.mkdir(parents=True, exist_ok=True)
-        session_path.write_text(raw or "", encoding="utf-8")
-        log(f"wrote Facebook session from env to {session_path}")
-    except Exception as exc:  # noqa: BLE001 - never crash startup over this
-        log(f"could not write Facebook session from env: {exc}")
-
-
 def telegram_supervisor() -> None:
+    if not active():
+        log("telegram disabled; cloud service is in staging mode")
+        return
     if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
         log("telegram supervisor disabled; TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
         return
@@ -100,12 +71,15 @@ def telegram_supervisor() -> None:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         log("starting telegram command bot")
-        child = subprocess.Popen(
-            [sys.executable, "-u", str(TELEGRAM_SCRIPT)],
-            cwd=str(ROOT),
-            env=env,
-            text=True,
-        )
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-u", str(TELEGRAM_SCRIPT)],
+                cwd=str(ROOT), env=env, text=True,
+            )
+        except OSError as exc:
+            log(f"telegram could not start: {type(exc).__name__}; retrying")
+            STOP_EVENT.wait(restart_delay_seconds)
+            continue
         CHILDREN.append(child)
         while child.poll() is None and not STOP_EVENT.is_set():
             time.sleep(2)
@@ -113,18 +87,85 @@ def telegram_supervisor() -> None:
             CHILDREN.remove(child)
         if STOP_EVENT.is_set():
             break
+        if child.returncode == 3:
+            log("telegram delivery conflict; waiting 15 minutes before checking again")
+            STOP_EVENT.wait(15 * 60)
+            continue
         log(f"telegram command bot exited code={child.returncode}; restarting in {restart_delay_seconds}s")
-        time.sleep(restart_delay_seconds)
+        STOP_EVENT.wait(restart_delay_seconds)
+
+
+def runtime_watchdog(workers: list[threading.Thread], display) -> None:
+    from urllib.request import urlopen
+    failures = 0
+    port = os.getenv("WEB_ROBOT_PORT") or os.getenv("PORT") or "8787"
+    while not STOP_EVENT.wait(30):
+        try:
+            with urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as response:
+                if response.status != 200:
+                    raise OSError("web service is not ready")
+            if any(not worker.is_alive() for worker in workers):
+                raise OSError("a required supervisor stopped")
+            if display is not None and display.poll() is not None:
+                raise OSError("verification display stopped")
+            failures = 0
+        except OSError as exc:
+            failures += 1
+            log(f"runtime health check failed {failures}/3: {type(exc).__name__}")
+            if failures >= 3:
+                log("runtime unhealthy; requesting a complete service restart")
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
 
 
 def main() -> int:
+    os.chdir(ROOT)
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+    web_robot_app.load_env_files()
+    prepare_runtime()
+    if active() and (not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID")):
+        raise RuntimeError("Active hosting requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    materialize_facebook_session()
-    threading.Thread(target=telegram_supervisor, daemon=True).start()
+    display = None
+    if os.name != "nt" and os.getenv("DISPLAY"):
+        display = subprocess.Popen(["Xvfb", os.getenv("DISPLAY", ":99"), "-screen", "0", "1024x768x24", "-nolisten", "tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        CHILDREN.append(display)
+    workers = []
+    if active():
+        workers.append(threading.Thread(target=telegram_supervisor, daemon=True))
+        if enabled("OWNER_SCAN_ENABLED"):
+            workers.append(threading.Thread(target=owner_scan_supervisor, daemon=True))
+    for worker in workers:
+        worker.start()
+    threading.Thread(target=runtime_watchdog, args=(workers, display), daemon=True).start()
     log(f"starting web app on Railway port={os.getenv('PORT', '8787')}")
-    return web_robot_app.main()
+    try:
+        return web_robot_app.main()
+    finally:
+        terminate_children()
+
+
+def owner_scan_supervisor() -> None:
+    if not active() or not enabled("OWNER_SCAN_ENABLED"):
+        return
+    while not STOP_EVENT.is_set():
+        child = None
+        try:
+            child = subprocess.Popen([sys.executable, "-u", str(ROOT / "owner_scheduler.py"), "--once"], cwd=ROOT)
+            CHILDREN.append(child)
+            while child.poll() is None and not STOP_EVENT.wait(2):
+                pass
+            if STOP_EVENT.is_set() and child.poll() is None:
+                child.terminate()
+            elif child.returncode:
+                log(f"owner scheduler exit={child.returncode}; cooldown saved in data/owner_schedule.json")
+        except OSError as exc:
+            log(f"owner scheduler could not start: {type(exc).__name__}")
+        finally:
+            if child in CHILDREN:
+                CHILDREN.remove(child)
+        STOP_EVENT.wait(300)
 
 
 if __name__ == "__main__":

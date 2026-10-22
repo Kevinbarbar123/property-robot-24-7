@@ -1,7 +1,13 @@
 __pycache__/
 *.pyc
-.env
-.env.private
+.env*
+!.env.example
 data/
 logs/
 reports/
+backups/
+output/
+.git/
+.railway/
+.playwright-mcp/
+*.tar.gz

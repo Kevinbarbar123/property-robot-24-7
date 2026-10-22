@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ctypes
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -21,16 +23,23 @@ import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
+import recovery
+import scan_progress
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, unquote, urlencode
 from urllib.request import Request, urlopen
 
 from property_bot import (
     BASE_URL,
     Listing,
+    SourceAccessError,
+    SourceResponseError,
+    extract_next_data,
+    extract_initial_state,
     extract_olx_search_hits,
     fetch_url,
     is_apartment_candidate,
@@ -39,33 +48,27 @@ from property_bot import (
     normalize_text,
     parse_page_count,
 )
-from owner_scoring import (
-    DEFAULT_RADIUS_KM,
-    FANAR_CENTER_LAT,
-    FANAR_CENTER_LNG,
-    SellerDetails,
-    agency_text_found,
-    extract_phone_number_from_description,
-    haversine_km,
-    infer_purpose,
-    is_agency_like,
-    is_facebook_listing,
-    likely_owner,
-    looks_like_reference_code_text,
-    merge_details,
-    normalize_phone_number,
-    preliminary_rejection_reasons,
-)
 
-try:
-    import facebook_marketplace
-except ImportError:
-    facebook_marketplace = None
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
+
+def safe_stderr(message: str) -> None:
+    try:
+        print(message, file=sys.stderr)
+    except OSError:
+        pass
 
 
 STATE_PATH = Path("data/telegram_owner_alert_state.json")
 LOCK_PATH = Path("data/telegram_owner_alert.lock")
 OUTBOX_PATH = Path("data/telegram_outbox.json")
+SCAN_HEALTH_PATH = Path("data/owner_scan_health.json")
+BROKER_BLACKLIST_PATH = Path("data/broker_blacklist.json")
+OWNER_PHRASES_PATH = Path("data/owner_phrases.json")
 CRASH_LOG_PATH = Path("logs/telegram_owner_alert.crash.log")
 LOG_DIR = Path("reports")
 LOCK_STALE_SECONDS = 2 * 60 * 60
@@ -74,10 +77,14 @@ DEFAULT_OWNER_POST_LIMIT = 2
 DEFAULT_OWNER_SCORE_THRESHOLD = 4
 DEFAULT_MIN_PRICE = 0
 DEFAULT_DETAIL_WORKERS = 6
-DEFAULT_MAX_CANDIDATES = 120
-DEFAULT_DETAIL_SCORE_LIMIT = 12
-DEFAULT_HISTORICAL_OWNER_SCORE_THRESHOLD = 5
-DEFAULT_FACEBOOK_MAX_LISTINGS = 60
+DEFAULT_MAX_CANDIDATES = 220
+DEFAULT_DETAIL_SCORE_LIMIT = 18
+QUERY_FALLBACK_PAGES = 1
+BROKER_ACCOUNT_ADS_LIMIT = 8
+OWNER_FILTER_REVISION = "2026-09-28"
+FANAR_CENTER_LAT = 33.877799
+FANAR_CENTER_LNG = 35.577951
+DEFAULT_RADIUS_KM = 15.0
 TARGET_AREA_LABEL = "the selected Metn target areas"
 TELEGRAM_API_HOST = "api.telegram.org"
 DEFAULT_TELEGRAM_CONNECT_HOSTS = (
@@ -189,10 +196,28 @@ OLX_TARGET_SEARCHES = {
         "location": "baouchriye",
         "aliases": ["baouchrieh", "bauchrieh", "baouchriyeh", "sad el baouchrieh", "sed el baouchrieh"],
     },
-    "Rabweh": {
-        "query": "rabweh",
-        "location": "rabweh",
-        "aliases": ["rabweh", "rabieh", "rabieh metn"],
+    "Sed El Bauchrieh": {
+        "query": "sed-el-baouchrieh",
+        "queries": ["sed-el-baouchrieh", "sad-el-baouchrieh", "sed-el-bauchrie", "sad-el-bauchrie"],
+        "location": "",
+        "aliases": [
+            "sed el baouchrieh",
+            "sad el baouchrieh",
+            "sed el bauchrie",
+            "sad el bauchrie",
+            "sed baouchrieh",
+            "sad baouchrieh",
+        ],
+    },
+    "Bourj Hammoud": {
+        "query": "bourj-hammoud",
+        "location": "bourj-hammoud",
+        "aliases": ["bourj hammoud", "bourj-hammoud", "burj hammoud", "bourj hamoud"],
+    },
+    "Dawra": {
+        "query": "dawra",
+        "location": "dawra",
+        "aliases": ["dawra", "daoura", "dora", "dowra"],
     },
     "Zalka": {
         "query": "zalka",
@@ -222,7 +247,7 @@ OLX_TARGET_SEARCHES = {
     "Kornet Chehwan": {
         "query": "kornet-chehwan",
         "location": "qornet_chahouane",
-        "aliases": ["kornet chehwan", "cornet chehwan", "qornet chehwan", "kornet-chehwan"],
+        "aliases": ["kornet chehwan", "cornet chehwan", "qornet chehwan", "qornet chehwen", "kornet-chehwan"],
     },
     "Ain Saadeh": {
         "query": "ain-saadeh",
@@ -251,8 +276,64 @@ OLX_TARGET_SEARCHES = {
     },
     "Ain Najem": {
         "query": "ain-najm",
+        "queries": ["ain-najm", "ain-najem"],
         "location": "ain-najm",
-        "aliases": ["ain najm", "ain najem", "ain-najm", "ain-najem"],
+        "aliases": ["ain najm", "ain najem", "ain-najm", "ain-najem", "عين نجم"],
+    },
+    "Naccache": {
+        "query": "naccache",
+        "location": "naccache",
+        "aliases": ["naccache", "naqache", "nakach", "naqach"],
+    },
+    "Awkar": {
+        "query": "awkar",
+        "location": "awkar",
+        "aliases": ["awkar", "aoukar", "aoukar metn"],
+    },
+    "Mtayleb": {
+        "query": "mtayleb",
+        "location": "mtayleb",
+        "aliases": ["mtayleb", "mtaileb", "mtailib", "metayleb"],
+    },
+    "Beit Chaar": {
+        "query": "beit-chaar",
+        "location": "beit-chaar",
+        "aliases": ["beit chaar", "beit-chaar", "beitchaar", "beit shaar"],
+    },
+    "Nabay": {
+        "query": "nabay",
+        "location": "",
+        "aliases": ["nabay", "nabay metn", "nabayh"],
+    },
+    "Baabdat": {
+        "query": "baabdat",
+        "location": "baabdat",
+        "aliases": ["baabdat", "b'abdat", "b abdat"],
+    },
+    "Rabieh": {
+        "query": "rabieh",
+        "location": "",
+        "aliases": ["rabieh", "rabieh metn", "rabiyeh", "rabieh lebanon"],
+    },
+    "Beit Misk": {
+        "query": "beit-misk",
+        "location": "",
+        "aliases": ["beit misk", "beit-misk", "bayt misk"],
+    },
+    "Majzoub": {
+        "query": "majzoub",
+        "location": "",
+        "aliases": ["majzoub", "mazjoub", "majzoub metn"],
+    },
+    "Wata Amaret Chalhoub": {
+        "query": "wata-amaret-chalhoub",
+        "location": "",
+        "aliases": ["wata amaret chalhoub", "wata-amaret-chalhoub", "amaret chalhoub", "amaret el chalhoub"],
+    },
+    "Qennabet Broumana": {
+        "query": "qennabet-broumana",
+        "location": "",
+        "aliases": ["qennabet broumana", "qennabet-broumana", "kenabet broumana", "qennabet broummana"],
     },
 }
 
@@ -266,6 +347,159 @@ TARGET_CITY_ALIASES = {
     for city, config in OLX_TARGET_SEARCHES.items()
     for alias in [city, *config["aliases"]]
 }
+
+AGENCY_TERMS = (
+    "agency",
+    "brokerage",
+    "real estate",
+    "properties",
+    "group",
+    "development",
+    "developers",
+    "company",
+    "s.a.r.l",
+    "sarl",
+    "estate",
+    "consultancy",
+    "consultants",
+    "c-properties",
+    "confidence",
+    "golden mark",
+    "golden land",
+    "balance real estate",
+    "escwa",
+    "yas real estate",
+    "عقارات",
+    "للعقارات",
+    "وسيط",
+    "وساطة",
+    "سمسار",
+    "مكتب عقاري",
+    "شركة عقارية",
+)
+
+AGENCY_NAME_TERMS = (
+    "properties",
+    "group",
+    "development",
+    "developers",
+    "company",
+    "s.a.r.l",
+    "sarl",
+    "estate",
+)
+
+AGENCY_CONTENT_TERMS = tuple(term for term in AGENCY_TERMS if term not in AGENCY_NAME_TERMS)
+
+BROKER_ROLE_TERMS = (
+    "agent",
+    "agents",
+    "broker",
+    "brokers",
+    "makler",
+)
+
+OWNER_POSITIVE_PATTERNS = (
+    r"\bdirect\s+owner\b",
+    r"\bdirect\s+from\s+(?:the\s+)?owner\b",
+    r"\bdirectly\s+from\s+(?:the\s+)?owner\b",
+    r"\bby\s+owner\b",
+    r"\bfrom\s+owner\b",
+    r"\bfrom\s+(?:the\s+)?owner\b",
+    r"\bprivate\s+owner\b",
+    r"\bowner\s+direct\b",
+    r"\bowner\s+directly\b",
+    r"\bno\s+(?:agents?|brokers?|agency|agencies)\b",
+    r"\bnot\s+(?:an?\s+)?(?:agent|broker|agency)\b",
+    r"\bwithout\s+(?:agents?|brokers?|agency|agencies)\b",
+    r"\bno\s+commission\b",
+    r"\bno\s+(?:real\s+estate|broker(?:age)?)\s+fees?\b",
+    r"\bsold\s+directly\s+by\s+(?:the\s+)?owner\b",
+)
+
+NEGATED_BROKER_PATTERNS = (
+    r"\bno\s+(?:real\s+estate\s+)?(?:agents?|brokers?|agency|agencies)\b",
+    r"\bnot\s+(?:an?\s+)?(?:real\s+estate\s+)?(?:agent|broker|agency)\b",
+    r"\bwithout\s+(?:real\s+estate\s+)?(?:agents?|brokers?|agency|agencies)\b",
+    r"\bowner\s+only\b",
+    r"\bdirect\s+owner\b",
+    r"\bowner\s+direct\b",
+    r"\bno\s+(?:real\s+estate|broker(?:age)?)\s+fees?\b",
+    r"\bsold\s+directly\s+by\s+(?:the\s+)?owner\b",
+)
+
+AGENCY_CODE_PREFIXES = (
+    "gmc",
+    "cprc",
+    "cpcc",
+    "cpes",
+    "cpsk",
+    "rgms",
+    "nkp",
+    "nk",
+    "dy",
+    "mqoa",
+    "sgrm",
+    "dpea",
+    "spm",
+    "rw",
+    "rwr",
+)
+
+ARABIC_DIGIT_TRANSLATION = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+IGNORED_PUBLIC_PHONE_NUMBERS = {
+    "+96176660119",
+}
+
+
+@dataclass
+class SellerDetails:
+    listing: Listing
+    seller_id: str = ""
+    seller_name: str = ""
+    phone_number: str = ""
+    account_ads_count: int | None = None
+    seller_type: str = ""
+    agency_name: str = ""
+    agency_id: str = ""
+    agent_code: str = ""
+    ownership: str = ""
+    purpose: str = ""
+    lat: float | None = None
+    lng: float | None = None
+    distance_km: float | None = None
+    description: str = ""
+    owner_score: int = 0
+    exclusion_reasons: tuple[str, ...] = ()
+    from_search_page: bool = False
+
+
+def confidence_label(score: int, reasons: Iterable[str] = ()) -> str:
+    reason_text = " ".join(reasons).lower()
+    if score <= 0 and not any(word in reason_text for word in ["agency", "broker", "account has", "reference code"]):
+        return "HIGH OWNER"
+    if score <= DEFAULT_OWNER_SCORE_THRESHOLD:
+        return "LIKELY OWNER"
+    if score <= 8:
+        return "MAYBE OWNER"
+    return "RISKY/AGENCY"
+
+
+def positive_reasons(details: SellerDetails, seller_post_count: int) -> list[str]:
+    reasons: list[str] = []
+    if seller_post_count <= 1:
+        reasons.append("single apartment post in target areas")
+    elif seller_post_count <= 3:
+        reasons.append(f"only {seller_post_count} apartment posts in target areas")
+    if not details.agency_name and not details.agency_id:
+        reasons.append("no OLX agency profile")
+    if details.account_ads_count is not None and details.account_ads_count <= 3:
+        reasons.append(f"small OLX account ({details.account_ads_count} ads)")
+    if details.phone_number:
+        reasons.append("phone found")
+    if owner_positive_text_found(details.seller_name, details.listing.title, details.description):
+        reasons.append("owner wording found")
+    return reasons[:4]
 
 
 def extract_json_string(raw_html: str, key: str) -> str:
@@ -393,6 +627,22 @@ def created_label_from_timestamp(timestamp: int | float | None) -> str:
     return f"{weeks} weeks ago"
 
 
+def timestamp_from_item(item: dict) -> float | None:
+    for key in ("timestamp", "productRefreshedAt", "createdAt"):
+        value = item.get(key)
+        if value in {None, ""}:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            if isinstance(value, str):
+                try:
+                    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+    return None
+
+
 def olx_listing_url(item: dict) -> str:
     external_id = get_nested_string(item, "externalID")
     slug = get_nested_string(item, "slug")
@@ -487,15 +737,17 @@ def search_item_to_details(item: dict, fallback_city: str, purpose: str) -> Sell
     contact_info = item.get("contactInfo") if isinstance(item.get("contactInfo"), dict) else {}
     description = get_nested_string(item, "description")
     phone_number = extract_phone_number_from_search_item(item, description)
+    published_timestamp = timestamp_from_item(item)
     listing = Listing(
         city=city,
         title=title,
         price_usd=get_nested_int(item, "extraFields", "price") or get_nested_int(item, "price"),
         sqm=get_nested_int(item, "extraFields", "ft"),
         location=item_location_text(item),
-        created=created_label_from_timestamp(item.get("timestamp") or item.get("createdAt")),
+        created=created_label_from_timestamp(published_timestamp),
         url=url,
         source=f"OLX Lebanon {purpose}",
+        published_ts=published_timestamp,
     )
     return SellerDetails(
         listing=listing,
@@ -583,6 +835,88 @@ def extract_phone_number_from_nested_data(value: object, depth: int = 0) -> str:
     return ""
 
 
+def find_seller_phone_in_page_data(value: object, depth: int = 0) -> str:
+    if depth > 10:
+        return ""
+    if isinstance(value, dict):
+        seller_markers = {
+            "adsCount",
+            "allowChatCommunicationInAds",
+            "commercialNumber",
+            "isAgency",
+            "isPhoneNumberVisible",
+            "isSellerVerified",
+            "isVerified",
+            "sellerProfile",
+        }
+        if any(key in value for key in seller_markers):
+            phone = extract_phone_number_from_nested_data(value)
+            if phone and phone not in IGNORED_PUBLIC_PHONE_NUMBERS:
+                return phone
+        for key in ("sellerProfile", "publicProfile"):
+            child = value.get(key)
+            phone = find_seller_phone_in_page_data(child, depth + 1)
+            if phone:
+                return phone
+        for child in value.values():
+            phone = find_seller_phone_in_page_data(child, depth + 1)
+            if phone:
+                return phone
+    elif isinstance(value, list):
+        for child in value[:300]:
+            phone = find_seller_phone_in_page_data(child, depth + 1)
+            if phone:
+                return phone
+    return ""
+
+
+def extract_phone_number_from_raw_seller_state(raw_html: str) -> str:
+    for match in re.finditer(r'"phoneNumber":"((?:\\.|[^"\\])*)"', raw_html):
+        try:
+            raw_value = json.loads(f'"{match.group(1)}"')
+        except json.JSONDecodeError:
+            raw_value = match.group(1)
+        phone = normalize_phone_number(raw_value)
+        if not phone or phone in IGNORED_PUBLIC_PHONE_NUMBERS:
+            continue
+        window = raw_html[max(0, match.start() - 1000) : match.end() + 1000].lower()
+        if any(
+            marker in window
+            for marker in (
+                '"sellerprofile"',
+                '"issellerverified"',
+                '"isphonenumbervisible"',
+                '"allowchatcommunicationinads"',
+                '"commercialnumber"',
+                '"adscount"',
+            )
+        ):
+            return phone
+    return ""
+
+
+def extract_phone_number_from_page_state(raw_html: str) -> str:
+    data = extract_next_data(raw_html)
+    phone = find_seller_phone_in_page_data(data)
+    if phone:
+        return phone
+    return extract_phone_number_from_raw_seller_state(raw_html)
+
+
+def extract_phone_number_from_links(raw_html: str) -> str:
+    link_patterns = [
+        r'href=["\']tel:([^"\']+)["\']',
+        r'href=["\']https?://(?:wa\.me|api\.whatsapp\.com/send)\?[^"\']*(?:phone=)?(\+?\d[\d%+\-. ]{6,})',
+        r'https?://wa\.me/(\+?\d[\d%+\-. ]{6,})',
+    ]
+    for pattern in link_patterns:
+        for match in re.finditer(pattern, raw_html, flags=re.I):
+            phone = normalize_phone_number(unquote(match.group(1)))
+            if phone and phone not in IGNORED_PUBLIC_PHONE_NUMBERS:
+                return phone
+    return ""
+
+
 def listing_external_id_from_url(url: str) -> str:
     match = re.search(r"-ID(\d+)\.html(?:$|\?)", url)
     return match.group(1) if match else ""
@@ -592,10 +926,41 @@ def find_current_listing_item(raw_html: str, listing: Listing) -> dict:
     external_id = listing_external_id_from_url(listing.url)
     if not external_id:
         return {}
+    data = extract_next_data(raw_html)
+    initial_state = {}
+    if isinstance(data.get("props"), dict):
+        page_props = data["props"].get("pageProps")
+        if isinstance(page_props, dict):
+            initial_state = page_props.get("initialState") if isinstance(page_props.get("initialState"), dict) else {}
+    ad_data = (
+        initial_state.get("ad", {}).get("data")
+        if isinstance(initial_state.get("ad"), dict)
+        else {}
+    )
+    if isinstance(ad_data, dict) and str(ad_data.get("externalID") or "") == external_id:
+        return ad_data
+    for item in find_dicts_by_external_id(data, external_id):
+        if item.get("title") or item.get("description") or item.get("rawDescription"):
+            return item
     for item in extract_search_result_objects(raw_html):
         if str(item.get("externalID") or "") == external_id:
             return item
     return {}
+
+
+def find_dicts_by_external_id(value: object, external_id: str, depth: int = 0) -> list[dict]:
+    if depth > 9:
+        return []
+    matches: list[dict] = []
+    if isinstance(value, dict):
+        if str(value.get("externalID") or value.get("id") or "") == external_id:
+            matches.append(value)
+        for child in value.values():
+            matches.extend(find_dicts_by_external_id(child, external_id, depth + 1))
+    elif isinstance(value, list):
+        for child in value[:250]:
+            matches.extend(find_dicts_by_external_id(child, external_id, depth + 1))
+    return matches
 
 
 def extract_page_state_object(raw_html: str, key: str) -> dict:
@@ -616,11 +981,28 @@ def extract_page_state_object(raw_html: str, key: str) -> dict:
 
 def extract_current_seller_profile(raw_html: str, listing: Listing) -> dict:
     external_id = listing_external_id_from_url(listing.url)
+    data = extract_next_data(raw_html)
+    initial_state = {}
+    if isinstance(data.get("props"), dict):
+        page_props = data["props"].get("pageProps")
+        if isinstance(page_props, dict):
+            initial_state = page_props.get("initialState") if isinstance(page_props.get("initialState"), dict) else {}
+
     seller_profile = extract_page_state_object(raw_html, "sellerProfile")
     params = seller_profile.get("params") if isinstance(seller_profile.get("params"), dict) else {}
     data = seller_profile.get("data") if isinstance(seller_profile.get("data"), dict) else {}
     if external_id and str(params.get("adExternalID") or "") == external_id:
         return data
+
+    ad_data = initial_state.get("ad", {}).get("data") if isinstance(initial_state.get("ad"), dict) else {}
+    public_user = initial_state.get("publicProfile", {}).get("user") if isinstance(initial_state.get("publicProfile"), dict) else {}
+    if (
+        isinstance(ad_data, dict)
+        and isinstance(public_user, dict)
+        and ad_data.get("userExternalID")
+        and str(public_user.get("externalID") or "") == str(ad_data.get("userExternalID"))
+    ):
+        return public_user
     return {}
 
 
@@ -630,6 +1012,17 @@ def extract_description(raw_html: str) -> str:
         return description
     match = re.search(r'<meta name="description" content="([^"]*)"', raw_html)
     return normalize_text(match.group(1)) if match else ""
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    radius = 6371.0
+    d_lat = math.radians(lat2 - lat1)
+    d_lng = math.radians(lng2 - lng1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng / 2) ** 2
+    )
+    return 2 * radius * math.asin(math.sqrt(a))
 
 
 def extract_geography(raw_html: str) -> tuple[float | None, float | None]:
@@ -644,15 +1037,65 @@ def extract_geography(raw_html: str) -> tuple[float | None, float | None]:
     return None, None
 
 
+def infer_purpose(listing: Listing) -> str:
+    source = listing.source.lower()
+    if "rent" in source:
+        return "rent"
+    if "sale" in source:
+        return "sale"
+    return "unknown"
+
+
+def normalize_phone_number(value: str) -> str:
+    value = value.translate(ARABIC_DIGIT_TRANSLATION)
+    digits = re.sub(r"\D", "", value)
+    if not digits:
+        return ""
+    if digits.startswith("00961"):
+        digits = digits[2:]
+    if digits.startswith("961") and len(digits) >= 10:
+        return f"+{digits}"
+    if digits.startswith("0") and len(digits) >= 8:
+        return f"+961{digits[1:]}"
+    if len(digits) == 7 and digits.startswith("3"):
+        return f"+961{digits}"
+    if len(digits) == 8 and digits[:2] in {"03", "70", "71", "76", "78", "79", "81"}:
+        return f"+961{digits[1:] if digits.startswith('0') else digits}"
+    if len(digits) == 8 and digits[:2] in {"01", "04", "05", "06", "07", "08", "09"}:
+        return f"+961{digits[1:]}"
+    if len(digits) == 7 and digits[0] in {"1", "4", "5", "6", "7", "8", "9"}:
+        return f"+961{digits}"
+    return ""
+
+
+def extract_phone_number_from_description(description: str) -> str:
+    description = description.translate(ARABIC_DIGIT_TRANSLATION)
+    phone_patterns = [
+        r"(?:\+|00)?961[\s./()-]*(?:3|70|71|76|78|79|81)[\s./()-]*\d{2,3}[\s./()-]*\d{2,3}[\s./()-]*\d{0,2}",
+        r"\b0?3[\s./()-]*\d{2,3}[\s./()-]*\d{2,3}[\s./()-]*\d{0,2}\b",
+        r"\b(?:70|71|76|78|79|81)[\s./()-]*\d{2,3}[\s./()-]*\d{2,3}[\s./()-]*\d{0,2}\b",
+        r"\b0?[1456789][\s./()-]*\d{2,3}[\s./()-]*\d{2,3}[\s./()-]*\d{0,2}\b",
+    ]
+    for pattern in phone_patterns:
+        match = re.search(pattern, description)
+        if match:
+            phone = normalize_phone_number(match.group(0))
+            if phone:
+                return phone
+    return ""
+
+
 def extract_phone_number(raw_html: str, description: str) -> str:
-    # Keep the old public helper name, but do not read phoneNumber globally from raw_html.
-    # OLX embeds unrelated agent objects on detail pages, which can attach a wrong phone.
-    return extract_phone_number_from_description(description)
+    return extract_phone_number_from_description(description) or extract_phone_number_from_links(raw_html)
 
 
 def enrich_listing(listing: Listing) -> SellerDetails:
+    saved = recovery.detail_work(listing)
+    if saved:
+        return saved
+    recovery.save_position(stage="details", area=listing.city, url=listing.url)
     try:
-        raw_html = fetch_url(listing.url, timeout=12, retries=0)
+        raw_html = fetch_url(listing.url, timeout=12, retries=2)
     except (HTTPError, URLError, TimeoutError) as exc:
         return SellerDetails(listing=listing, exclusion_reasons=(f"detail fetch failed: {exc}",))
 
@@ -662,7 +1105,11 @@ def enrich_listing(listing: Listing) -> SellerDetails:
     agency = current_item.get("agency") if isinstance(current_item.get("agency"), dict) else {}
     contact_info = current_item.get("contactInfo") if isinstance(current_item.get("contactInfo"), dict) else {}
 
-    description = get_nested_string(current_item, "description") if current_item else extract_description(raw_html)
+    description = (
+        get_nested_string(current_item, "description")
+        or get_nested_string(current_item, "rawDescription")
+        or extract_description(raw_html)
+    )
     seller_name = (
         normalize_text(str(seller_profile.get("name") or ""))
         or
@@ -680,8 +1127,10 @@ def enrich_listing(listing: Listing) -> SellerDetails:
     profile_phone = extract_phone_number_from_nested_data(seller_profile)
     description_phone = extract_phone_number_from_description(description)
     listing_phone = extract_phone_number_from_search_item(current_item, description) if current_item else ""
-    phone_number = description_phone or profile_phone or listing_phone
-    return SellerDetails(
+    page_state_phone = extract_phone_number_from_page_state(raw_html)
+    link_phone = extract_phone_number_from_links(raw_html)
+    phone_number = description_phone or listing_phone or profile_phone or page_state_phone or link_phone
+    result = SellerDetails(
         listing=listing,
         seller_id=normalize_text(str(seller_profile.get("externalID") or ""))
         or get_nested_string(current_item, "userExternalID")
@@ -700,6 +1149,13 @@ def enrich_listing(listing: Listing) -> SellerDetails:
         distance_km=distance_km,
         description=description,
     )
+    if not current_item and not seller_profile and not seller_name:
+        raise SourceResponseError("OLX detail page data was not recognized.", url=listing.url)
+    recovery.save_detail(result)
+    if scan_progress.CURRENT_JOB:
+        from reliability_config import load_reliability
+        recovery.current_store().save_cache(listing.url, raw_html, load_reliability().detail_cache_seconds)
+    return result
 
 
 def extract_contact_name(raw_html: str) -> str:
@@ -710,6 +1166,55 @@ def extract_contact_name(raw_html: str) -> str:
         return json.loads(f'"{match.group(1)}"')
     except json.JSONDecodeError:
         return normalize_text(match.group(1))
+
+
+def agency_text_found(*values: str) -> bool:
+    text = " ".join(value for value in values if value).lower()
+    for pattern in NEGATED_BROKER_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.I)
+    if any(term in text for term in AGENCY_CONTENT_TERMS):
+        return True
+    if any(re.search(rf"\b{re.escape(term)}\b", text, flags=re.I) for term in BROKER_ROLE_TERMS):
+        return True
+    seller_name = values[0].lower() if len(values) >= 2 and values[0] else ""
+    return any(term in seller_name for term in AGENCY_NAME_TERMS)
+
+
+def owner_positive_text_found(*values: str) -> bool:
+    text = " ".join(value for value in values if value).lower()
+    if any(re.search(pattern, text, flags=re.I) for pattern in OWNER_POSITIVE_PATTERNS):
+        return True
+    try:
+        data = json.loads(OWNER_PHRASES_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    phrases = data.get("items") if isinstance(data, dict) else data
+    if not isinstance(phrases, list):
+        return False
+    normalized_text = normalize_for_match(text)
+    return any(normalize_for_match(str(phrase)) in normalized_text for phrase in phrases if str(phrase).strip())
+
+
+def looks_like_reference_code(details: SellerDetails) -> bool:
+    text = f"{details.listing.title} {details.description}"
+    return bool(re.search(r"\b(?:ref|reference|code)\s*#?\s*[a-z]{1,4}\d{2,}\b", text, re.I))
+
+
+def looks_like_reference_code_text(text: str) -> bool:
+    return bool(re.search(r"\b(?:ref|reference|code)\s*#?\s*[a-z]{1,4}\d{2,}\b", text, re.I))
+
+
+def preliminary_rejection_reasons(listing: Listing) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if not is_apartment_candidate(listing):
+        reasons.append("not apartment-like")
+    if looks_like_reference_code_text(listing.title):
+        reasons.append("real-estate reference code found in title")
+    if re.search(r"\b(?:gmc|cprc|cpcc|cpes|cpsk|rgms|nkp|nk|dy|mqoa|sgrm|dpea|spm|rw|rwr)\w*\d+\w*\b", listing.title, re.I):
+        reasons.append("broker-style code found in title")
+    if agency_text_found(listing.title):
+        reasons.append("agency keyword found in title")
+    return tuple(reasons)
 
 
 def candidate_sort_key(listing: Listing) -> tuple[int, float, int]:
@@ -725,14 +1230,148 @@ def candidate_sort_key(listing: Listing) -> tuple[int, float, int]:
     return (title_penalty, age_hours, listing.price_usd or 0)
 
 
+def agency_like_agent_code(value: str) -> bool:
+    code = re.sub(r"[^a-z0-9]", "", value.lower())
+    if not code or code == "n":
+        return False
+    return any(code.startswith(prefix) and any(char.isdigit() for char in code) for prefix in AGENCY_CODE_PREFIXES)
+
+
+def agent_code_is_broker_signal(details: SellerDetails) -> bool:
+    code = re.sub(r"[^a-z0-9]", "", details.agent_code.lower())
+    if not code or code == "n":
+        return False
+    if details.seller_type.lower() in {"2", "business", "agency"}:
+        return True
+    if agency_like_agent_code(code):
+        return True
+    context = f"{details.listing.title} {details.description}"
+    visible_codes = re.findall(r"\b(?:ref|reference|code)\s*#?\s*([a-z0-9][a-z0-9-]*)", context, re.I)
+    return any(re.sub(r"[^a-z0-9]", "", value.lower()) == code for value in visible_codes)
+
+
+def score_owner_likelihood(
+    details: SellerDetails,
+    seller_post_count: int,
+    phone_post_count: int = 0,
+) -> tuple[int, tuple[str, ...]]:
+    score = 0
+    reasons: list[str] = []
+    seller_type = details.seller_type.lower()
+
+    if not is_apartment_candidate(details.listing):
+        score += 100
+        reasons.append("not apartment-like")
+    if details.distance_km is None:
+        score += 7
+        reasons.append("missing coordinates")
+    elif details.distance_km > DEFAULT_RADIUS_KM:
+        score += 100
+        reasons.append(f"{details.distance_km:.1f}km from Fanar")
+
+    if seller_post_count > 3:
+        score += 10
+        reasons.append(f"seller has {seller_post_count} apartment posts in target areas")
+    elif seller_post_count == 3:
+        score += 5
+        reasons.append("seller has 3 apartment posts in target areas")
+
+    if phone_post_count > 3:
+        score += 10
+        reasons.append(f"phone appears on {phone_post_count} apartment posts in target areas")
+    elif phone_post_count == 3:
+        score += 5
+        reasons.append("phone appears on 3 apartment posts in target areas")
+
+    if details.account_ads_count is not None:
+        if details.account_ads_count > BROKER_ACCOUNT_ADS_LIMIT:
+            score += 3
+            reasons.append(f"account has {details.account_ads_count} OLX ads")
+        elif details.account_ads_count > 3:
+            score += 2
+            reasons.append(f"account has {details.account_ads_count} OLX ads")
+
+    if details.agency_name or details.agency_id:
+        score += 6
+        reasons.append("agency profile present")
+    if agent_code_is_broker_signal(details):
+        if agency_like_agent_code(details.agent_code):
+            score += 6
+            reasons.append("agency-style reference code present")
+        small_private_account = (
+            not details.agency_name
+            and not details.agency_id
+            and seller_type not in {"2", "business", "agency"}
+            and seller_post_count <= 3
+        )
+        score += 5 if small_private_account else 7
+        reasons.append("agent/reference code present")
+    if agency_text_found(details.seller_name, details.listing.title, details.description):
+        score += 6
+        reasons.append("agency keyword found")
+    if looks_like_reference_code(details):
+        score += 3
+        reasons.append("real-estate reference code found")
+    if seller_type in {"business", "agency", "2"}:
+        score += 1
+        reasons.append(f"declared seller type is {details.seller_type}")
+
+    if owner_positive_text_found(details.seller_name, details.listing.title, details.description):
+        score -= 4
+        reasons.append("owner wording found")
+    return score, tuple(reasons)
+
+
+def likely_owner(
+    details: SellerDetails,
+    seller_post_count: int,
+    owner_score_threshold: int,
+    phone_post_count: int = 0,
+) -> tuple[bool, tuple[str, ...]]:
+    score, reasons = score_owner_likelihood(details, seller_post_count, phone_post_count)
+    details.owner_score = score
+    return score <= owner_score_threshold and not is_agency_like(details, seller_post_count), reasons
+
+
+def merge_details(search_details: SellerDetails, fetched_details: SellerDetails) -> SellerDetails:
+    if fetched_details.exclusion_reasons and not fetched_details.seller_name:
+        search_details.exclusion_reasons = fetched_details.exclusion_reasons
+        return search_details
+
+    return SellerDetails(
+        listing=search_details.listing,
+        seller_id=fetched_details.seller_id or search_details.seller_id,
+        seller_name=fetched_details.seller_name or search_details.seller_name,
+        phone_number=fetched_details.phone_number or search_details.phone_number,
+        account_ads_count=fetched_details.account_ads_count,
+        seller_type=fetched_details.seller_type or search_details.seller_type,
+        agency_name=fetched_details.agency_name or search_details.agency_name,
+        agency_id=fetched_details.agency_id or search_details.agency_id,
+        agent_code=fetched_details.agent_code or search_details.agent_code,
+        ownership=fetched_details.ownership or search_details.ownership,
+        purpose=fetched_details.purpose or search_details.purpose,
+        lat=fetched_details.lat if fetched_details.lat is not None else search_details.lat,
+        lng=fetched_details.lng if fetched_details.lng is not None else search_details.lng,
+        distance_km=(
+            fetched_details.distance_km
+            if fetched_details.distance_km is not None
+            else search_details.distance_km
+        ),
+        description=fetched_details.description or search_details.description,
+        owner_score=search_details.owner_score,
+        exclusion_reasons=search_details.exclusion_reasons,
+        from_search_page=True,
+    )
+
+
 def enrich_listings(listings: list[Listing], workers: int, detail_delay: float) -> list[SellerDetails]:
     if not listings:
         return []
-    workers = max(1, workers)
+    workers = min(2, max(1, workers))
     if workers == 1:
         details = []
         for index, listing in enumerate(listings, start=1):
-            print(f"Inspecting seller {index}/{len(listings)}: {listing.url}", file=sys.stderr)
+            safe_stderr(f"Inspecting seller {index}/{len(listings)}: {listing.url}")
             details.append(enrich_listing(listing))
             time.sleep(detail_delay)
         return details
@@ -742,11 +1381,17 @@ def enrich_listings(listings: list[Listing], workers: int, detail_delay: float) 
         futures = {executor.submit(enrich_listing, listing): listing for listing in listings}
         for index, future in enumerate(as_completed(futures), start=1):
             listing = futures[future]
-            print(f"Inspected seller {index}/{len(listings)}: {listing.url}", file=sys.stderr)
+            safe_stderr(f"Inspected seller {index}/{len(listings)}: {listing.url}")
             try:
                 details_list.append(future.result())
-            except Exception as exc:
-                details_list.append(SellerDetails(listing=listing, exclusion_reasons=(f"detail fetch failed: {exc}",)))
+            except SourceResponseError:
+                for pending in futures:
+                    pending.cancel()
+                raise
+            except Exception:
+                for pending in futures:
+                    pending.cancel()
+                raise
             if detail_delay:
                 time.sleep(detail_delay)
     return details_list
@@ -786,63 +1431,108 @@ def olx_search_url(category_slug: str, query_slug: str, page: int, location_slug
     return url
 
 
+def olx_search_sources(
+    category_slug: str,
+    query_slug: str,
+    location_slug: str,
+    max_pages: int,
+    query_slugs: Iterable[str] | None = None,
+) -> list[tuple[str, str, str, int]]:
+    sources = [("area", location_slug, query_slug, max_pages)]
+    if location_slug:
+        seen_queries: set[str] = set()
+        for fallback_query in [*(query_slugs or []), query_slug]:
+            if fallback_query in seen_queries:
+                continue
+            seen_queries.add(fallback_query)
+            sources.append((f"query fallback {fallback_query}", "", fallback_query, QUERY_FALLBACK_PAGES))
+    return sources
+
+
 def collect_fanar_radius_seed_details(max_pages: int, delay: float) -> list[SellerDetails]:
     all_details: list[SellerDetails] = []
     max_pages = max(1, max_pages)
+    requests_started = 0
+    consecutive_failures = 0
 
     for purpose, category_slug in OLX_PURPOSES.items():
         for area, config in OLX_TARGET_SEARCHES.items():
             query = config["query"]
+            queries = config.get("queries", [query])
             location = config.get("location", "")
-            first_url = olx_search_url(category_slug, query, 1, location)
-            print(f"Fetching {purpose} {area}: {first_url}", file=sys.stderr)
-            try:
-                first_html = fetch_url(first_url, timeout=15, retries=1)
-            except (HTTPError, URLError, TimeoutError) as exc:
-                print(f"  skipped {purpose} {area}: {exc}", file=sys.stderr)
-                continue
-
-            page_count = min(parse_page_count(first_html), max_pages)
-            all_details.extend(search_page_details(first_html, area, purpose))
-
-            for page in range(2, page_count + 1):
-                time.sleep(delay)
-                url = olx_search_url(category_slug, query, page, location)
-                print(f"Fetching {purpose} {area} page {page}/{page_count}: {url}", file=sys.stderr)
+            for source_name, source_location, source_query, source_page_limit in olx_search_sources(
+                category_slug,
+                query,
+                location,
+                max_pages,
+                queries,
+            ):
+                first_url = olx_search_url(category_slug, source_query, 1, source_location)
+                saved = recovery.page_work(first_url)
+                if requests_started and saved is None:
+                    time.sleep(max(0.8, delay))
+                requests_started += 1
+                safe_stderr(f"Fetching {purpose} {area} ({source_name}): {first_url}")
+                recovery.save_position(stage="search", area=area, purpose=purpose, source=source_name, page=1, url=first_url)
                 try:
-                    raw_html = fetch_url(url, timeout=15, retries=1)
+                    first_html = fetch_url(first_url, timeout=15, retries=2) if saved is None else ""
                 except (HTTPError, URLError, TimeoutError) as exc:
-                    print(f"  skipped {purpose} {area} page {page}: {exc}", file=sys.stderr)
+                    safe_stderr(f"  skipped {purpose} {area} ({source_name}): {exc}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        raise SourceResponseError("Three consecutive OLX search requests failed; coverage is incomplete.") from exc
                     continue
-                all_details.extend(search_page_details(raw_html, area, purpose))
 
+                consecutive_failures = 0
+                page_count = min(saved["pages"] if saved else parse_page_count(first_html), max_pages, source_page_limit)
+                first_details = [recovery.restore_details(item) for item in saved["details"]] if saved else search_page_details(first_html, area, purpose)
+                if saved is None:
+                    recovery.save_page(first_url, first_details, page_count)
+                all_details.extend(first_details)
+
+                for page in range(2, page_count + 1):
+                    url = olx_search_url(category_slug, source_query, page, source_location)
+                    safe_stderr(f"Fetching {purpose} {area} ({source_name}) page {page}/{page_count}: {url}")
+                    saved = recovery.page_work(url)
+                    if saved is None:
+                        time.sleep(delay)
+                    recovery.save_position(stage="search", area=area, purpose=purpose, source=source_name, page=page, url=url)
+                    try:
+                        raw_html = fetch_url(url, timeout=15, retries=2) if saved is None else ""
+                    except (HTTPError, URLError, TimeoutError) as exc:
+                        safe_stderr(f"  skipped {purpose} {area} ({source_name}) page {page}: {exc}")
+                        continue
+                    page_details = [recovery.restore_details(item) for item in saved["details"]] if saved else search_page_details(raw_html, area, purpose)
+                    if saved is None:
+                        recovery.save_page(url, page_details, page_count)
+                    all_details.extend(page_details)
+
+    if not all_details:
+        raise SourceResponseError("No listings could be collected across the target areas; search health needs checking.")
     return dedupe_seller_details(all_details)
-
-
-def collect_facebook_seed_details(args: argparse.Namespace) -> list[SellerDetails]:
-    if args.skip_facebook or facebook_marketplace is None:
-        return []
-
-    session_path = args.facebook_session or facebook_marketplace.session_path_from_env()
-    try:
-        return facebook_marketplace.collect_facebook_radius_seed_details(
-            max_listings_per_purpose=args.facebook_max_listings,
-            session_path=session_path,
-        )
-    except facebook_marketplace.FacebookSessionError as exc:
-        print(f"Skipping Facebook Marketplace: {exc}", file=sys.stderr)
-    except Exception as exc:
-        print(f"Facebook Marketplace scan failed: {exc}", file=sys.stderr)
-    return []
 
 
 def search_page_details(raw_html: str, area: str, purpose: str) -> list[SellerDetails]:
     details: list[SellerDetails] = []
-    for item in extract_search_result_objects(raw_html):
+    items = extract_search_result_objects(raw_html)
+    if not items:
+        state = extract_initial_state(raw_html)
+        search = state.get("search", {}) if isinstance(state, dict) else {}
+        ads = search.get("ads", {}) if isinstance(search, dict) else {}
+        if not isinstance(ads, dict) or ads.get("totalHits") != 0 or not isinstance(ads.get("hits"), list):
+            raise SourceResponseError("OLX search data was not recognized; cannot report this as an empty search.", url=(current_url()))
+    for item in items:
         result = search_item_to_details(item, area, purpose)
         if result:
             details.append(result)
     return details
+
+
+def current_url() -> str:
+    if not scan_progress.CURRENT_JOB:
+        return ""
+    job = recovery.current_store().job(scan_progress.CURRENT_JOB)
+    return json.loads(job.get("position", "{}")).get("url", "")
 
 
 def dedupe_seller_details(details: Iterable[SellerDetails]) -> list[SellerDetails]:
@@ -862,13 +1552,99 @@ def load_state(path: Path) -> dict:
         backup_path = path.with_name(f"{path.name}.corrupt-{datetime.now():%Y%m%d_%H%M%S}.bak")
         try:
             os.replace(path, backup_path)
-            print(f"State file was corrupt; backed it up to {backup_path} and started fresh.", file=sys.stderr)
+            safe_stderr(f"State file was corrupt; backed it up to {backup_path} and started fresh.")
         except OSError as exc:
-            print(f"State file is corrupt and could not be backed up: {exc}", file=sys.stderr)
+            safe_stderr(f"State file is corrupt and could not be backed up: {exc}")
         return {"seen_urls": []}
     except OSError as exc:
-        print(f"State file could not be read; starting safely with empty state: {exc}", file=sys.stderr)
+        safe_stderr(f"State file could not be read; starting safely with empty state: {exc}")
         return {"seen_urls": []}
+
+
+def load_string_list_json(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, dict):
+        values = data.get("items") or data.get("terms") or []
+    else:
+        values = data
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def phone_digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def blacklist_term_matches(details: SellerDetails, term: str) -> bool:
+    raw = str(term or "").strip()
+    if not raw:
+        return False
+
+    lowered = raw.lower()
+    if lowered.startswith(("http://", "https://")):
+        return lowered.rstrip("/") == details.listing.url.lower().rstrip("/")
+
+    digits = phone_digits(raw)
+    if digits and len(digits) >= 7 and not re.search(r"[a-z]", lowered):
+        return digits == phone_digits(details.phone_number)
+
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{20,}", lowered):
+        return lowered == details.seller_id.lower()
+
+    normalized = normalize_for_match(raw)
+    if len(normalized) < 4 or not re.search(r"[a-z]", normalized):
+        return False
+    seller_fields = [normalize_for_match(details.seller_name), normalize_for_match(details.agency_name)]
+    return any(
+        field and re.search(rf"\b{re.escape(normalized)}\b", field)
+        for field in seller_fields
+    )
+
+
+def blacklist_reasons(details: SellerDetails, blacklist_terms: Iterable[str]) -> tuple[str, ...]:
+    return tuple(
+        f"blacklisted broker/seller term: {term}"
+        for term in blacklist_terms
+        if blacklist_term_matches(details, term)
+    )
+
+
+def learned_broker_terms(limit: int = 40) -> list[str]:
+    terms: set[str] = set()
+    reports = sorted(LOG_DIR.glob("owner_alert_decisions_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for report in reports[:limit]:
+        try:
+            data = json.loads(report.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("summary", {}).get("dry_run"):
+            continue
+        for item in data.get("rejected") or []:
+            reasons = " ".join(str(reason).lower() for reason in item.get("exclusion_reasons") or [])
+            seller_posts = safe_int(item.get("seller_target_post_count")) or 0
+            strong_agency = (
+                bool(item.get("agency_name") or item.get("agency_id"))
+                or seller_posts > 3
+                or "agency profile present" in reasons
+                or "declared seller type is 2" in reasons
+                or "phone appears on" in reasons
+            )
+            if not strong_agency:
+                continue
+            seller_id = str(item.get("seller_id") or "").strip()
+            if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{20,}", seller_id):
+                terms.add(seller_id)
+            phone = str(item.get("phone_number") or "").strip()
+            if phone and (item.get("agency_name") or item.get("agency_id") or seller_posts > 3):
+                terms.add(phone)
+    return sorted(terms)
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -885,7 +1661,7 @@ def save_state(path: Path, state: dict) -> None:
             last_error = exc
             time.sleep(0.2)
     if last_error is not None:
-        print(f"State file could not be saved after retries: {last_error}", file=sys.stderr)
+        safe_stderr(f"State file could not be saved after retries: {last_error}")
     try:
         temp_path.unlink(missing_ok=True)
     except OSError:
@@ -902,12 +1678,12 @@ def load_message_outbox(path: Path = OUTBOX_PATH) -> list[dict]:
         backup_path = path.with_name(f"{path.name}.corrupt-{datetime.now():%Y%m%d_%H%M%S}.bak")
         try:
             os.replace(path, backup_path)
-            print(f"Outbox file was corrupt; backed it up to {backup_path}.", file=sys.stderr)
+            safe_stderr(f"Outbox file was corrupt; backed it up to {backup_path}.")
         except OSError as exc:
-            print(f"Outbox file is corrupt and could not be backed up: {exc}", file=sys.stderr)
+            safe_stderr(f"Outbox file is corrupt and could not be backed up: {exc}")
         return []
     except OSError as exc:
-        print(f"Outbox file could not be read; continuing without queued messages: {exc}", file=sys.stderr)
+        safe_stderr(f"Outbox file could not be read; continuing without queued messages: {exc}")
         return []
     return data if isinstance(data, list) else []
 
@@ -926,14 +1702,14 @@ def save_message_outbox(messages: list[dict], path: Path = OUTBOX_PATH) -> None:
             last_error = exc
             time.sleep(0.2)
     if last_error is not None:
-        print(f"Outbox file could not be saved after retries: {last_error}", file=sys.stderr)
+        safe_stderr(f"Outbox file could not be saved after retries: {last_error}")
     try:
         temp_path.unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def queue_telegram_message(chat_id: str, message: str, reason: str, path: Path = OUTBOX_PATH) -> None:
+def queue_telegram_message(chat_id: str, message: str, reason: str, path: Path = OUTBOX_PATH, *, delivery_key: str = "") -> None:
     messages = load_message_outbox(path)
     messages.append(
         {
@@ -941,6 +1717,7 @@ def queue_telegram_message(chat_id: str, message: str, reason: str, path: Path =
             "message": message,
             "reason": reason,
             "queued_at": datetime.now().isoformat(timespec="seconds"),
+            "delivery_key": delivery_key,
         }
     )
     save_message_outbox(messages, path)
@@ -959,7 +1736,7 @@ def flush_telegram_outbox(token: str, path: Path = OUTBOX_PATH) -> int:
         if not chat_id or not message:
             continue
         try:
-            send_telegram_message(token, chat_id, message)
+            send_telegram_message(token, chat_id, message, delivery_key=item.get("delivery_key", ""))
             sent_count += 1
         except (TelegramAPIError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             item["last_error"] = str(exc)
@@ -978,17 +1755,48 @@ def telegram_connect_hosts() -> list[str]:
     return list(DEFAULT_TELEGRAM_CONNECT_HOSTS)
 
 
+def lock_pid(path: Path) -> int | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        return int(data.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def process_is_running(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def install_run_lock(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     while True:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
+            owner_pid = lock_pid(path)
             try:
                 age_seconds = time.time() - path.stat().st_mtime
             except FileNotFoundError:
                 continue
-            if age_seconds > LOCK_STALE_SECONDS:
+            if not process_is_running(owner_pid):
                 try:
                     path.unlink()
                 except OSError:
@@ -1026,7 +1834,7 @@ def telegram_api(
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         data = None
-        connect_hosts: list[str | None] = telegram_connect_hosts() + [None]
+        connect_hosts: list[str | None] = [None] if method == "sendMessage" and retries == 0 else telegram_connect_hosts() + [None]
         for connect_host in connect_hosts:
             try:
                 data = telegram_api_request(token, method, payload, timeout, connect_host)
@@ -1108,20 +1916,41 @@ def telegram_api_request(
             return json.loads(body.decode("utf-8"))
 
 
-def send_telegram_message(token: str, chat_id: str, message: str) -> None:
+def send_telegram_message(token: str, chat_id: str, message: str, *, delivery_key: str = "") -> None:
     # Telegram messages have a hard length cap. Split on listing boundaries when possible.
+    chat_ids = [
+        item.strip()
+        for item in re.split(r"[,;\s]+", str(chat_id or ""))
+        if item.strip()
+    ]
+    if not chat_ids:
+        raise ValueError("Telegram chat id is missing.")
     chunks = split_message(message)
-    for chunk in chunks:
-        telegram_api(
-            token,
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": chunk,
-                "disable_web_page_preview": "true",
-            },
-        )
-        time.sleep(0.3)
+    for destination_chat_id in chat_ids:
+        for chunk_index, chunk in enumerate(chunks):
+            key = f"{delivery_key}:{destination_chat_id}:{chunk_index}" if delivery_key else ""
+            progress = recovery.current_store() if key else None
+            if key and not progress.claim_delivery(key):
+                continue
+            try:
+                response = telegram_api(
+                    token,
+                    "sendMessage",
+                    {
+                        "chat_id": destination_chat_id,
+                        "text": chunk,
+                        "disable_web_page_preview": "true",
+                    },
+                    retries=0 if key else 3,
+                )
+            except Exception as error:
+                if key:
+                    status = "failed" if isinstance(error, (HTTPError, TelegramAPIError)) else "unknown"
+                    progress.delivered(key, status)
+                raise
+            if key:
+                progress.delivered(key, "sent", response.get("result", {}).get("message_id", ""))
+            time.sleep(0.3)
 
 
 def split_message(message: str, max_len: int = 3900) -> list[str]:
@@ -1142,25 +1971,70 @@ def split_message(message: str, max_len: int = 3900) -> list[str]:
     return chunks
 
 
+def whatsapp_number(raw_phone: str) -> str:
+    digits = re.sub(r"\D", "", raw_phone)
+    if not digits:
+        return ""
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("9610"):
+        return "961" + digits[4:]
+    if digits.startswith("961"):
+        return digits
+    if digits.startswith("0"):
+        return "961" + digits[1:]
+    if len(digits) in {7, 8}:
+        return "961" + digits
+    return digits
+
+
+def whatsapp_message(details: SellerDetails) -> str:
+    listing = details.listing
+    return (
+        "Hi sir, I hope you are well. "
+        f"I saw your apartment listing on OLX: {listing.title}. "
+        "Would you be open to working with a broker if I have a serious client for it? "
+        f"{listing.url}"
+    ).strip()
+
+
+def whatsapp_link(details: SellerDetails) -> str:
+    number = whatsapp_number(details.phone_number)
+    if not number:
+        return ""
+    return f"https://wa.me/{number}?text={quote(whatsapp_message(details))}"
+
+
 def format_listing(details: SellerDetails, seller_post_count: int) -> str:
     listing = details.listing
     ratio = money(listing.price_per_sqm) if listing.price_per_sqm is not None else "n/a"
     seller = details.seller_name or "unknown account"
-    source_label = "Facebook" if is_facebook_listing(listing) else "OLX"
-    phone = details.phone_number or f"not shown by {source_label}"
+    phone = details.phone_number or "not shown by OLX"
+    wa_link = whatsapp_link(details)
     distance = f"{details.distance_km:.1f}km from Fanar" if details.distance_km is not None else "distance unknown"
     purpose = details.purpose or infer_purpose(listing)
-    return "\n".join(
+    confidence = confidence_label(details.owner_score, details.exclusion_reasons)
+    why_sent = positive_reasons(details, seller_post_count)
+    lines = [
+        f"{confidence} | {listing.city} {purpose}: {listing.title}",
+        f"Price: {money(listing.price_usd)} | SQM: {listing.sqm or 'n/a'} | USD/SQM: {ratio}",
+        f"Location: {listing.location or 'n/a'} | {distance} | Posted: {listing.created or 'n/a'}",
+        "Source: OLX",
+        f"Account: {seller}",
+        f"Phone: {phone}",
+    ]
+    if why_sent:
+        lines.append("Why sent: " + "; ".join(why_sent))
+    if wa_link:
+        lines.append(f"Tap for WhatsApp Business: {wa_link}")
+    lines.extend(
         [
-            f"{listing.city} {purpose}: {listing.title}",
-            f"Price: {money(listing.price_usd)} | SQM: {listing.sqm or 'n/a'} | USD/SQM: {ratio}",
-            f"Location: {listing.location or 'n/a'} | {distance} | Posted: {listing.created or 'n/a'}",
-            f"Account: {seller}",
-            f"Phone: {phone}",
             f"Owner score: {details.owner_score} | Apartment posts found in target areas: {seller_post_count}",
             f"Link: {listing.url}",
         ]
     )
+    return "\n".join(lines)
+
 
 
 def listing_age(created: str) -> timedelta | None:
@@ -1221,6 +2095,8 @@ def build_alert_message(
                     "",
                     "Scan summary:",
                     f"Checked: {summary.get('new_listings', 0)} new sale/rent listings",
+                    f"Previously rejected listings rechecked: {summary.get('rechecked_listings', 0)}",
+                    f"Source: OLX ({summary.get('new_listings', 0)} new listings)",
                     f"Inside target radius: {summary.get('inside_radius', 0)}",
                     f"Private-looking pages opened for confirmation: {summary.get('detail_checked', 0)}",
                     f"Agency/business-like rejected: {summary.get('agency_like_rejected', 0)}",
@@ -1240,6 +2116,10 @@ def build_alert_message(
     )
     best = ranked[:best_count]
     lines = [f"Owner-listing alert {now}", "", f"New likely-owner listings: {len(owner_details)}"]
+    if summary:
+        lines.append(f"Source checked: OLX ({summary.get('new_listings', 0)} new listings)")
+        if summary.get("rechecked_listings"):
+            lines.append(f"Previously rejected listings rechecked: {summary['rechecked_listings']}")
     if best:
         lines.extend(["", "Best price/sqm among today's owner-like listings:"])
         for index, (details, seller_count) in enumerate(best, start=1):
@@ -1263,6 +2143,46 @@ def write_decision_log(
     return path
 
 
+def report_seen_urls(limit: int = 80) -> set[str]:
+    urls: set[str] = set()
+    reports = sorted(LOG_DIR.glob("owner_alert_decisions_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for report in reports[:limit]:
+        try:
+            data = json.loads(report.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("summary", {}).get("dry_run"):
+            continue
+        for section in ("accepted", "rejected"):
+            for item in data.get(section) or []:
+                url = str(item.get("url") or "").strip()
+                if url:
+                    urls.add(url)
+    return urls
+
+
+def owner_filter_recheck_urls(state: dict, days: int = 10) -> set[str]:
+    cutoff = datetime.now() - timedelta(days=days)
+    candidates: set[str] = set()
+    accepted: set[str] = set()
+    for report in LOG_DIR.glob("owner_alert_decisions_*.json"):
+        try:
+            report_date = datetime.strptime(report.stem.removeprefix("owner_alert_decisions_"), "%Y%m%d_%H%M%S")
+            data = json.loads(report.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if data.get("summary", {}).get("dry_run"):
+            continue
+        accepted.update(item.get("url", "") for item in data.get("accepted", []))
+        if report_date < cutoff:
+            continue
+        for item in data.get("rejected", []):
+            if not item.get("agency_name") and not item.get("agency_id") and str(item.get("seller_type") or "").lower() not in {"2", "business", "agency"}:
+                candidates.add(item.get("url", ""))
+    reviewed = state.get("owner_filter_rechecks", {}).get(OWNER_FILTER_REVISION, [])
+    return candidates.difference(accepted, reviewed, {""})
+
+
 def decision_row(details: SellerDetails, seller_count: int) -> dict:
     listing = details.listing
     return {
@@ -1273,8 +2193,14 @@ def decision_row(details: SellerDetails, seller_count: int) -> dict:
         "price_per_sqm": listing.price_per_sqm,
         "location": listing.location,
         "created": listing.created,
-        "url": listing.url,
+        "published_timestamp": listing.published_ts,
+        "published_at": (
+            datetime.fromtimestamp(listing.published_ts).isoformat(timespec="seconds")
+            if listing.published_ts
+            else ""
+        ),
         "source": listing.source,
+        "url": listing.url,
         "seller_id": details.seller_id,
         "seller_name": details.seller_name,
         "phone_number": details.phone_number,
@@ -1289,6 +2215,8 @@ def decision_row(details: SellerDetails, seller_count: int) -> dict:
         "lng": details.lng,
         "distance_km": details.distance_km,
         "owner_score": details.owner_score,
+        "confidence": confidence_label(details.owner_score, details.exclusion_reasons),
+        "why_sent": positive_reasons(details, seller_count),
         "seller_target_post_count": seller_count,
         "exclusion_reasons": list(details.exclusion_reasons),
         "from_search_page": details.from_search_page,
@@ -1318,6 +2246,23 @@ def build_summary(
         "rejected": len(rejected),
         "agency_like_rejected": agency_like_rejected,
     }
+
+
+def is_agency_like(details: SellerDetails, seller_count: int) -> bool:
+    if seller_count > 3:
+        return True
+    if details.agency_name or details.agency_id:
+        return True
+    if agency_like_agent_code(details.agent_code):
+        return True
+    if agent_code_is_broker_signal(details) and not (
+        seller_count <= 3
+        and details.seller_type.lower() not in {"2", "business", "agency"}
+    ):
+        return True
+    if details.seller_type in {"2", "business", "agency"}:
+        return True
+    return agency_text_found(details.seller_name, details.listing.title, details.description)
 
 
 def private_looking_near_misses(
@@ -1385,46 +2330,75 @@ def load_env_files() -> None:
     load_dotenv(Path(".env.private"), override=True)
 
 
-def run(args: argparse.Namespace) -> int:
+def credential_missing(value: str, *, kind: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return True
+    lowered = normalized.lower()
+    if "replace_with_your" in lowered:
+        return True
+    if kind == "token" and normalized.endswith(":replace_with_your_bot_token"):
+        return True
+    if kind == "chat_id" and "replace_with_your_chat_id" in lowered:
+        return True
+    return False
+
+
+def _run(args: argparse.Namespace) -> int:
     load_env_files()
     token = args.telegram_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = args.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
 
     if args.show_chat_id:
         if not token:
-            print("Set TELEGRAM_BOT_TOKEN first.", file=sys.stderr)
+            safe_stderr("Set TELEGRAM_BOT_TOKEN first.")
             return 2
         try:
             print(get_chat_id(token))
         except (TelegramAPIError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-            print(f"Telegram error: {exc}", file=sys.stderr)
+            safe_stderr(f"Telegram error: {exc}")
             return 2
         return 0
-
-    if args.owner_score_threshold == DEFAULT_OWNER_SCORE_THRESHOLD and args.created_within_days >= 21:
-        args.owner_score_threshold = DEFAULT_HISTORICAL_OWNER_SCORE_THRESHOLD
 
     try:
         install_run_lock(args.lock)
     except RuntimeError as exc:
         print(exc)
-        return 0
+        return 4
 
-    if token:
+    health = load_state(SCAN_HEALTH_PATH)
+    if float(health.get("retry_after", 0)) > time.time() and health.get("status") not in {"captcha", "rate_limited", "access_restricted", "temporary", "schema_changed"}:
+        safe_stderr("OLX search is paused after a source failure. The independent scheduler will retry after the cooldown.")
+        return 3
+
+    recovery.begin_scan(args)
+    incident = recovery.current_store().current_incident()
+    if incident and (incident["kind"] in {"captcha", "schema_changed"} or incident["retry_at"] > time.time() or recovery.current_store().get("stopped_incident") == incident["id"]):
+        raise SourceAccessError("OLX session is paused; see /status or /verify.", kind=incident["kind"], url=incident["url"], retry_at=incident["retry_at"], provider=incident["provider"])
+
+    if token and not args.dry_run:
         sent_pending = flush_telegram_outbox(token)
         if sent_pending:
             print(f"Sent {sent_pending} queued Telegram message(s).")
 
     state = load_state(args.state)
-    seen_urls = set(state.get("seen_urls", []))
+    blacklist_terms = [*load_string_list_json(BROKER_BLACKLIST_PATH), *learned_broker_terms()]
+    historical_seen_urls = set() if args.ignore_seen else report_seen_urls()
+    seen_urls = set(state.get("seen_urls", [])).union(historical_seen_urls)
+    recheck_urls = owner_filter_recheck_urls(state)
     details_list = collect_fanar_radius_seed_details(max_pages=args.max_pages, delay=args.delay)
-    details_list.extend(collect_facebook_seed_details(args))
+    print(f"Collected {len(details_list)} listings from OLX.")
     new_details = details_list if args.ignore_seen else [
-        details for details in details_list if details.listing.url not in seen_urls
+        details for details in details_list if details.listing.url not in seen_urls or details.listing.url in recheck_urls
     ]
     new_details = [details for details in new_details if (details.listing.price_usd or 0) >= args.min_price]
     new_details = [details for details in new_details if within_created_days(details.listing, args.created_within_days)]
     new_details.sort(key=lambda details: candidate_sort_key(details.listing))
+    saved_selection = recovery.current_store().work(scan_progress.CURRENT_JOB, "selection")
+    if saved_selection is not None:
+        new_details = [recovery.restore_details(item) for item in saved_selection]
+    else:
+        recovery.current_store().save_work(scan_progress.CURRENT_JOB, "selection", [recovery.serialize_details(item) for item in new_details])
 
     print(f"Collected {len(details_list)} listings; {len(new_details)} are new after state filtering.")
 
@@ -1450,7 +2424,6 @@ def run(args: argparse.Namespace) -> int:
         for details in initial_scored
         if details.owner_score <= args.detail_score_limit
         and not preliminary_rejection_reasons(details.listing)
-        and not is_facebook_listing(details.listing)
     ]
     detail_candidates = balanced_detail_candidates(detail_candidates, args.max_candidates)
     print(
@@ -1476,6 +2449,46 @@ def run(args: argparse.Namespace) -> int:
             details = merge_details(details, fetched)
         merged_details.append(details)
 
+    provisional_phone_counts = dict(phone_counts)
+    for details in merged_details:
+        if details.phone_number:
+            provisional_phone_counts[details.phone_number] = max(
+                provisional_phone_counts.get(details.phone_number, 0),
+                sum(1 for item in merged_details if item.phone_number == details.phone_number),
+            )
+
+    final_phone_checks: list[SellerDetails] = []
+    for details in merged_details:
+        if details.phone_number or details.listing.url in fetched_by_url:
+            continue
+        key = details.seller_id or details.seller_name or details.listing.url
+        seller_count = seller_counts.get(key, 1)
+        phone_count = provisional_phone_counts.get(details.phone_number, 0)
+        ok, _ = likely_owner(details, seller_count, args.owner_score_threshold, phone_count)
+        if ok:
+            final_phone_checks.append(details)
+    final_phone_checks = sorted(final_phone_checks, key=lambda details: candidate_sort_key(details.listing))[
+        : max(0, args.final_phone_checks)
+    ]
+    if final_phone_checks:
+        print(
+            f"Opening {len(final_phone_checks)} accepted listings that still have no phone, "
+            "for a final OLX detail-page phone check."
+        )
+        final_fetched = enrich_listings(
+            [details.listing for details in final_phone_checks],
+            args.detail_workers,
+            args.detail_delay,
+        )
+        final_fetched_by_url = {details.listing.url: details for details in final_fetched}
+        refreshed_details: list[SellerDetails] = []
+        for details in merged_details:
+            fetched = final_fetched_by_url.get(details.listing.url)
+            if fetched:
+                details = merge_details(details, fetched)
+            refreshed_details.append(details)
+        merged_details = refreshed_details
+
     merged_phone_counts = dict(phone_counts)
     for details in merged_details:
         if details.phone_number:
@@ -1489,13 +2502,21 @@ def run(args: argparse.Namespace) -> int:
         seller_count = seller_counts.get(key, 1)
         phone_count = merged_phone_counts.get(details.phone_number, 0)
         ok, reasons = likely_owner(details, seller_count, args.owner_score_threshold, phone_count)
+        blacklist_hits = blacklist_reasons(details, blacklist_terms)
+        if blacklist_hits:
+            ok = False
+            reasons = (*reasons, *blacklist_hits)
         details.exclusion_reasons = reasons
         if ok:
             accepted.append((details, seller_count))
         else:
             rejected.append((details, seller_count))
 
-    summary = build_summary(new_details, accepted, rejected, len(detail_candidates))
+    summary = build_summary(new_details, accepted, rejected, len(detail_candidates) + len(final_phone_checks))
+    summary["dry_run"] = args.dry_run
+    summary["owner_filter_revision"] = OWNER_FILTER_REVISION
+    summary["rechecked_listings"] = sum(details.listing.url in recheck_urls for details in new_details)
+    summary["new_listings"] -= summary["rechecked_listings"]
     near_misses = private_looking_near_misses(rejected)
     log_path = write_decision_log(accepted, rejected, summary)
     print(f"Accepted {len(accepted)} likely-owner listings; rejected {len(rejected)}. Log: {log_path}")
@@ -1505,26 +2526,63 @@ def run(args: argparse.Namespace) -> int:
         print("\n--- Telegram dry run ---\n")
         print(message)
     else:
-        if not token or not chat_id:
-            print("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or use --dry-run.", file=sys.stderr)
+        missing_vars: list[str] = []
+        if credential_missing(token, kind="token"):
+            missing_vars.append("TELEGRAM_BOT_TOKEN")
+        if credential_missing(chat_id, kind="chat_id"):
+            missing_vars.append("TELEGRAM_CHAT_ID")
+        if missing_vars:
+            safe_stderr(
+                "Missing Telegram credentials: "
+                + ", ".join(missing_vars)
+                + ". Update .env or .env.private, or use --dry-run."
+            )
             return 2
         try:
-            send_telegram_message(token, chat_id, message)
+            send_telegram_message(token, chat_id, message, delivery_key="scan:" + scan_progress.CURRENT_JOB)
         except (TelegramAPIError, HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-            queue_telegram_message(chat_id, message, str(exc))
-            print(f"Telegram send error: {exc}", file=sys.stderr)
+            if not any(recovery.current_store().delivery_status(f"scan:{scan_progress.CURRENT_JOB}:{destination.strip()}:{index}") in {"sending", "unknown"} for destination in re.split(r"[,;\s]+", str(chat_id)) if destination.strip() for index in range(len(split_message(message)))):
+                queue_telegram_message(chat_id, message, str(exc), delivery_key="scan:" + scan_progress.CURRENT_JOB)
+            safe_stderr(f"Telegram send error: {exc}")
 
     if args.mark_seen_on_dry_run or not args.dry_run:
         processed_urls = {details.listing.url for details in new_details}
-        state["seen_urls"] = sorted(seen_urls.union(processed_urls))
+        state["seen_urls"] = sorted(seen_urls.union(processed_urls).union(historical_seen_urls))
+        rechecks = state.setdefault("owner_filter_rechecks", {})
+        rechecks[OWNER_FILTER_REVISION] = sorted(set(rechecks.get(OWNER_FILTER_REVISION, [])).union(processed_urls.intersection(recheck_urls)))
         state["last_run_at"] = datetime.now().isoformat(timespec="seconds")
         save_state(args.state, state)
 
+    if not args.dry_run:
+        health.update(status="ok", error="", retry_after=0, last_success_at=datetime.now().isoformat(timespec="seconds"))
+        save_state(SCAN_HEALTH_PATH, health)
+    recovery.current_store().status(scan_progress.CURRENT_JOB, "complete")
     return 0
+
+
+def run(args: argparse.Namespace) -> int:
+    try:
+        return _run(args)
+    except SourceResponseError as exc:
+        if exc.kind == "pending_job":
+            safe_stderr(str(exc))
+            return 4
+        health = load_state(SCAN_HEALTH_PATH)
+        incident = recovery.handle_failure(args, exc, health)
+        status = "blocked" if isinstance(exc, SourceAccessError) else "failed"
+        summary = {"status": status, "error": str(exc), "accepted": 0, "rejected": 0, "collected_after_filters": 0, "coverage_complete": False}
+        report = write_decision_log([], [], summary)
+        safe_stderr(f"Search {status}: {exc} Report: {report}")
+        save_state(SCAN_HEALTH_PATH, health)
+        return 3
+    finally:
+        scan_progress.CURRENT_JOB = ""
+        scan_progress.CURRENT_STORE = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Send daily Telegram alerts for likely-owner apartment listings.")
+    parser.add_argument("--resume-job", default="", help=argparse.SUPPRESS)
     parser.add_argument("--telegram-token", default="", help="Telegram bot token. Defaults to TELEGRAM_BOT_TOKEN.")
     parser.add_argument("--telegram-chat-id", default="", help="Telegram chat id. Defaults to TELEGRAM_CHAT_ID.")
     parser.add_argument("--show-chat-id", action="store_true", help="Print latest chat id after you message the bot.")
@@ -1545,13 +2603,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-candidates",
         type=int,
         default=DEFAULT_MAX_CANDIDATES,
-        help="Maximum private-looking seller detail pages to inspect after search-page scoring. Default: 120.",
+        help="Maximum private-looking seller detail pages to inspect after search-page scoring. Default: 220.",
     )
     parser.add_argument(
         "--detail-score-limit",
         type=int,
         default=DEFAULT_DETAIL_SCORE_LIMIT,
-        help="Open detail pages only when the search-page owner score is at or below this value. Default: 12.",
+        help="Open detail pages only when the search-page owner score is at or below this value. Default: 18.",
+    )
+    parser.add_argument(
+        "--final-phone-checks",
+        type=int,
+        default=80,
+        help="Accepted listings with no phone get this many extra OLX detail-page phone checks before reporting. Default: 80.",
     )
     parser.add_argument(
         "--created-within-days",
@@ -1570,23 +2634,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_OWNER_SCORE_THRESHOLD,
         help="Accept listings with owner-likelihood score at or below this value. Lower is stricter. Default: 4.",
-    )
-    parser.add_argument(
-        "--skip-facebook",
-        action="store_true",
-        help="Skip the Facebook Marketplace scan even if a saved session is available.",
-    )
-    parser.add_argument(
-        "--facebook-max-listings",
-        type=int,
-        default=DEFAULT_FACEBOOK_MAX_LISTINGS,
-        help=f"Facebook Marketplace search results to scan per purpose (rent/sale). Default: {DEFAULT_FACEBOOK_MAX_LISTINGS}.",
-    )
-    parser.add_argument(
-        "--facebook-session",
-        type=Path,
-        default=None,
-        help="Override the saved Facebook session path. Defaults to FACEBOOK_SESSION_PATH or data/facebook_session_state.json.",
     )
     parser.add_argument("--ignore-seen", action="store_true", help="Scan matching listings even if already in state.")
     parser.add_argument("--dry-run", action="store_true", help="Print the Telegram message instead of sending.")

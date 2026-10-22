@@ -7,4 +7,13 @@ reports/
 data/*_state.json
 
 .env.private
+.env
+.env.*
+!.env.example
+data/
+backups/
+output/
+.railway/
+.playwright-mcp/
+*.tar.gz
 

@@ -24,8 +24,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
+from source_errors import SourceAccessError, SourceResponseError
+from source_client import fetch as reliable_fetch
+from reliability_config import load_reliability
 
-BASE_URL = "https://www.olx.com.lb"
+
+BASE_URL = "https://olx.com.lb"
 DEFAULT_OUTPUT_DIR = Path("reports")
 CRASH_LOG_PATH = Path("logs/property_bot.crash.log")
 NON_APARTMENT_TERMS = (
@@ -92,6 +96,28 @@ CITY_SEARCHES = {
         "location": "baouchriye",
         "aliases": ["baouchrieh", "bauchrieh", "baouchriyeh", "sad el baouchrieh", "sed el baouchrieh"],
     },
+    "Sed El Bauchrieh": {
+        "query": "sed-el-baouchrieh",
+        "location": "",
+        "aliases": [
+            "sed el baouchrieh",
+            "sad el baouchrieh",
+            "sed el bauchrie",
+            "sad el bauchrie",
+            "sed baouchrieh",
+            "sad baouchrieh",
+        ],
+    },
+    "Bourj Hammoud": {
+        "query": "bourj-hammoud",
+        "location": "bourj-hammoud",
+        "aliases": ["bourj hammoud", "bourj-hammoud", "burj hammoud", "bourj hamoud"],
+    },
+    "Dawra": {
+        "query": "dawra",
+        "location": "dawra",
+        "aliases": ["dawra", "daoura", "dora", "dowra"],
+    },
     "Nahr El Mott": {
         "query": "nahr-el-mott",
         "location": "nahr-el-mott",
@@ -100,7 +126,7 @@ CITY_SEARCHES = {
     "Kornet Chehwan": {
         "query": "kornet-chehwan",
         "location": "qornet_chahouane",
-        "aliases": ["kornet chehwan", "cornet chehwan", "qornet chehwan", "kornet-chehwan"],
+        "aliases": ["kornet chehwan", "cornet chehwan", "qornet chehwan", "qornet chehwen", "kornet-chehwan"],
     },
     "Ain Saadeh": {
         "query": "ain-saadeh",
@@ -117,6 +143,61 @@ CITY_SEARCHES = {
         "location": "mar_roukoz",
         "aliases": ["mar roukoz", "mar roukos", "mar-roukoz", "mar-roukos"],
     },
+    "Naccache": {
+        "query": "naccache",
+        "location": "naccache",
+        "aliases": ["naccache", "naqache", "nakach", "naqach"],
+    },
+    "Awkar": {
+        "query": "awkar",
+        "location": "awkar",
+        "aliases": ["awkar", "aoukar", "aoukar metn"],
+    },
+    "Mtayleb": {
+        "query": "mtayleb",
+        "location": "mtayleb",
+        "aliases": ["mtayleb", "mtaileb", "mtailib", "metayleb"],
+    },
+    "Beit Chaar": {
+        "query": "beit-chaar",
+        "location": "beit-chaar",
+        "aliases": ["beit chaar", "beit-chaar", "beitchaar", "beit shaar"],
+    },
+    "Nabay": {
+        "query": "nabay",
+        "location": "",
+        "aliases": ["nabay", "nabay metn", "nabayh"],
+    },
+    "Baabdat": {
+        "query": "baabdat",
+        "location": "baabdat",
+        "aliases": ["baabdat", "b'abdat", "b abdat"],
+    },
+    "Rabieh": {
+        "query": "rabieh",
+        "location": "",
+        "aliases": ["rabieh", "rabieh metn", "rabiyeh", "rabieh lebanon"],
+    },
+    "Beit Misk": {
+        "query": "beit-misk",
+        "location": "",
+        "aliases": ["beit misk", "beit-misk", "bayt misk"],
+    },
+    "Majzoub": {
+        "query": "majzoub",
+        "location": "",
+        "aliases": ["majzoub", "mazjoub", "majzoub metn"],
+    },
+    "Wata Amaret Chalhoub": {
+        "query": "wata-amaret-chalhoub",
+        "location": "",
+        "aliases": ["wata amaret chalhoub", "wata-amaret-chalhoub", "amaret chalhoub", "amaret el chalhoub"],
+    },
+    "Qennabet Broumana": {
+        "query": "qennabet-broumana",
+        "location": "",
+        "aliases": ["qennabet broumana", "qennabet-broumana", "kenabet broumana", "qennabet broummana"],
+    },
 }
 
 
@@ -130,6 +211,7 @@ class Listing:
     created: str
     url: str
     source: str = "OLX Lebanon"
+    published_ts: float | None = None
 
     @property
     def price_per_sqm(self) -> float | None:
@@ -170,31 +252,7 @@ def parse_sqm(value: str | None) -> int | None:
 
 
 def fetch_url(url: str, timeout: int = 30, retries: int = 2, retry_delay: float = 2.0) -> str:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
-    for attempt in range(retries + 1):
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                return response.read().decode("utf-8", "replace")
-        except HTTPError as exc:
-            if exc.code < 500 or attempt == retries:
-                raise
-            time.sleep(retry_delay * (attempt + 1))
-        except (URLError, TimeoutError, OSError):
-            if attempt == retries:
-                raise
-            time.sleep(retry_delay * (attempt + 1))
-
-    raise TimeoutError(f"Unable to fetch {url}")
+    return reliable_fetch(url, timeout, retries, retry_delay, urlopen)
 
 
 def olx_search_url(query_slug: str, page: int, location_slug: str = "") -> str:
@@ -208,22 +266,38 @@ def olx_search_url(query_slug: str, page: int, location_slug: str = "") -> str:
 
 
 def extract_next_data(raw_html: str) -> dict:
-    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', raw_html, flags=re.S)
-    if not match:
+    from html.parser import HTMLParser
+    selector = load_reliability().next_data_selector
+    if not re.fullmatch(r"script#[A-Za-z0-9_-]+", selector):
+        raise ValueError("next_data_selector must select a script by ID")
+    class DataParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=False)
+            self.active = False
+            self.parts = []
+        def handle_starttag(self, tag, attrs):
+            if tag == "script" and dict(attrs).get("id") == selector.split("#", 1)[1]:
+                self.active = True
+        def handle_endtag(self, tag):
+            if tag == "script":
+                self.active = False
+        def handle_data(self, data):
+            if self.active:
+                self.parts.append(data)
+    parser = DataParser()
+    parser.feed(raw_html)
+    payload = "".join(parser.parts)
+    if not payload:
         return {}
     try:
-        value = json.loads(match.group(1))
+        value = json.loads(payload)
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
 
 
 def extract_olx_search_hits(raw_html: str) -> list[dict]:
-    data = extract_next_data(raw_html)
-    page_props = data.get("props", {}).get("pageProps", {}) if isinstance(data.get("props"), dict) else {}
-    initial_state = page_props.get("initialState") if isinstance(page_props, dict) else {}
-    if not isinstance(initial_state, dict):
-        initial_state = data.get("props", {}).get("initialState", {}) if isinstance(data.get("props"), dict) else {}
+    initial_state = extract_initial_state(raw_html)
     search = initial_state.get("search") if isinstance(initial_state, dict) else {}
     if not isinstance(search, dict):
         return []
@@ -244,6 +318,17 @@ def extract_olx_search_hits(raw_html: str) -> list[dict]:
             seen_ids.add(external_id)
             hits.append(item)
     return hits
+
+
+def extract_initial_state(raw_html: str) -> dict:
+    data = extract_next_data(raw_html)
+    for path in load_reliability().search_state_paths:
+        value = data
+        for key in path.split("."):
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def item_location_text(item: dict) -> str:
@@ -286,6 +371,18 @@ def created_label_from_timestamp(timestamp: object) -> str:
     return f"{max(2, round(age_days / 7))} weeks ago"
 
 
+def timestamp_value(timestamp: object) -> float | None:
+    try:
+        return float(timestamp)
+    except (TypeError, ValueError):
+        if isinstance(timestamp, str):
+            try:
+                return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
+
+
 def olx_listing_url(item: dict) -> str:
     external_id = normalize_text(str(item.get("externalID") or ""))
     slug = normalize_text(str(item.get("slug") or ""))
@@ -307,6 +404,7 @@ def parse_olx_json_page(raw_html: str, city: str, aliases: Iterable[str], strict
         if strict and not any(term in match_blob for term in alias_terms):
             continue
         extra_fields = item.get("extraFields") if isinstance(item.get("extraFields"), dict) else {}
+        published_timestamp = timestamp_value(item.get("timestamp") or item.get("createdAt"))
         listings.append(
             Listing(
                 city=city,
@@ -314,8 +412,9 @@ def parse_olx_json_page(raw_html: str, city: str, aliases: Iterable[str], strict
                 price_usd=safe_int(extra_fields.get("price")) or safe_int(item.get("price")),
                 sqm=safe_int(extra_fields.get("ft")),
                 location=location,
-                created=created_label_from_timestamp(item.get("timestamp") or item.get("createdAt")),
+                created=created_label_from_timestamp(published_timestamp),
                 url=url,
+                published_ts=published_timestamp,
             )
         )
     return listings

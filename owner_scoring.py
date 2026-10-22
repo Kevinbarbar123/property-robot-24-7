@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Shared owner-likelihood scoring rules used by every listing source (OLX,
-Facebook Marketplace, ...).
+Shared owner-likelihood scoring rules for OLX listings.
 
 Keeping this in one module means every source is judged by the same rules:
 apartment-only, inside the selected Metn target areas, and scored by how
@@ -48,6 +47,28 @@ AGENCY_TERMS = (
     "yas real estate",
 )
 
+AGENCY_NAME_TERMS = (
+    "properties",
+    "property",
+    "group",
+    "development",
+    "developers",
+    "company",
+    "s.a.r.l",
+    "sarl",
+    "estate",
+)
+
+AGENCY_CONTENT_TERMS = tuple(term for term in AGENCY_TERMS if term not in AGENCY_NAME_TERMS)
+BROKER_ROLE_TERMS = ("agent", "agents", "broker", "brokers", "makler")
+NEGATED_BROKER_PATTERNS = (
+    r"\bno\s+(?:real\s+estate\s+)?(?:agents?|brokers?|agency|agencies)\b",
+    r"\bnot\s+(?:an?\s+)?(?:real\s+estate\s+)?(?:agent|broker|agency)\b",
+    r"\bwithout\s+(?:real\s+estate\s+)?(?:agents?|brokers?|agency|agencies)\b",
+    r"\bno\s+(?:real\s+estate|broker(?:age)?)\s+fees?\b",
+    r"\bsold\s+directly\s+by\s+(?:the\s+)?owner\b",
+)
+
 AGENCY_CODE_PREFIXES = (
     "gmc",
     "cprc",
@@ -67,9 +88,8 @@ AGENCY_CODE_PREFIXES = (
 )
 
 # Approximate centroid for each selected Metn target area, used to score
-# distance from Fanar when a source (e.g. Facebook Marketplace) does not
-# expose precise listing coordinates. These are approximate town centers,
-# not exact addresses.
+# distance from Fanar when a listing does not expose precise coordinates.
+# These are approximate town centers, not exact addresses.
 TARGET_AREAS: dict[str, dict[str, object]] = {
     "Fanar": {"aliases": ["fanar"], "lat": 33.8778, "lng": 35.5780},
     "Mar Roukoz": {"aliases": ["mar roukoz", "mar roukos", "mar-roukoz", "mar-roukos"], "lat": 33.8651, "lng": 35.5938},
@@ -144,10 +164,6 @@ def distance_from_fanar(lat: float, lng: float) -> float:
     return haversine_km(FANAR_CENTER_LAT, FANAR_CENTER_LNG, lat, lng)
 
 
-def is_facebook_listing(listing: Listing) -> bool:
-    return listing.source.startswith("Facebook Marketplace")
-
-
 @dataclass
 class SellerDetails:
     listing: Listing
@@ -215,7 +231,14 @@ def extract_phone_number_from_description(description: str) -> str:
 
 def agency_text_found(*values: str) -> bool:
     text = " ".join(value for value in values if value).lower()
-    return any(term in text for term in AGENCY_TERMS)
+    for pattern in NEGATED_BROKER_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.I)
+    if any(term in text for term in AGENCY_CONTENT_TERMS):
+        return True
+    if any(re.search(rf"\b{re.escape(term)}\b", text, flags=re.I) for term in BROKER_ROLE_TERMS):
+        return True
+    seller_name = values[0].lower() if len(values) >= 2 and values[0] else ""
+    return any(term in seller_name for term in AGENCY_NAME_TERMS)
 
 
 def looks_like_reference_code(details: SellerDetails) -> bool:
@@ -232,6 +255,19 @@ def agency_like_agent_code(value: str) -> bool:
     if not code or code == "n":
         return False
     return any(code.startswith(prefix) and any(char.isdigit() for char in code) for prefix in AGENCY_CODE_PREFIXES)
+
+
+def agent_code_is_broker_signal(details: SellerDetails) -> bool:
+    code = re.sub(r"[^a-z0-9]", "", details.agent_code.lower())
+    if not code or code == "n":
+        return False
+    if details.seller_type.lower() in {"2", "business", "agency"}:
+        return True
+    if agency_like_agent_code(code):
+        return True
+    context = f"{details.listing.title} {details.description}"
+    visible_codes = re.findall(r"\b(?:ref|reference|code)\s*#?\s*([a-z0-9][a-z0-9-]*)", context, re.I)
+    return any(re.sub(r"[^a-z0-9]", "", value.lower()) == code for value in visible_codes)
 
 
 def preliminary_rejection_reasons(listing: Listing) -> tuple[str, ...]:
@@ -255,7 +291,6 @@ def score_owner_likelihood(
     score = 0
     reasons: list[str] = []
     seller_type = details.seller_type.lower()
-    facebook = is_facebook_listing(details.listing)
 
     if not is_apartment_candidate(details.listing):
         score += 100
@@ -267,16 +302,7 @@ def score_owner_likelihood(
         score += 100
         reasons.append(f"{details.distance_km:.1f}km from Fanar")
 
-    # Facebook never exposes OLX's structured agency_id/agent_code fields, so
-    # a broker posting from a personal profile looks identical to a real
-    # individual on every signal below except repeat posts. Catch those
-    # earlier than OLX needs to, since Facebook scans sample far fewer
-    # listings per run, so even 2 posts from the same seller is meaningful.
-    if facebook:
-        if seller_post_count > 1:
-            score += 8
-            reasons.append(f"seller has {seller_post_count} apartment posts in target areas")
-    elif seller_post_count > 3:
+    if seller_post_count > 3:
         score += 8
         reasons.append(f"seller has {seller_post_count} apartment posts in target areas")
     elif seller_post_count == 3:
@@ -290,7 +316,7 @@ def score_owner_likelihood(
     if details.agency_name or details.agency_id:
         score += 6
         reasons.append("agency profile present")
-    if details.agent_code:
+    if agent_code_is_broker_signal(details):
         if agency_like_agent_code(details.agent_code):
             score += 6
             reasons.append("agency-style reference code present")
@@ -309,17 +335,11 @@ def score_owner_likelihood(
         score += 3
         reasons.append("real-estate reference code found")
     if seller_type in {"business", "agency", "2"}:
-        # On Facebook, posting from a business Page (vs. a personal profile)
-        # is the only hard-to-fake structural signal left, equivalent to
-        # OLX's "agency profile present" -- so it gets the same weight.
-        score += 6 if facebook else 1
+        score += 1
         reasons.append(f"declared seller type is {details.seller_type}")
 
     positive_text = f"{details.seller_name} {details.listing.title} {details.description}".lower()
-    # "Owner direct, no agency" is a known broker disguise, and Facebook has
-    # no structural field to cross-check it against (unlike OLX's declared
-    # seller type), so this credit only applies to OLX.
-    if not facebook and any(term in positive_text for term in ["owner", "direct owner", "by owner", "private owner"]):
+    if any(term in positive_text for term in ["owner", "direct owner", "by owner", "private owner"]):
         score -= 2
         reasons.append("owner wording found")
     if details.phone_number:
@@ -347,7 +367,7 @@ def is_agency_like(details: SellerDetails, seller_count: int) -> bool:
         return True
     if agency_like_agent_code(details.agent_code):
         return True
-    if details.agent_code and not (
+    if agent_code_is_broker_signal(details) and not (
         seller_count <= 3
         and details.seller_type.lower() not in {"2", "business", "agency"}
     ):
