@@ -54,6 +54,6 @@ If cloud activation fails, stop the cloud listener/scanner before re-enabling th
 
 ## Validation
 
-Windows: `python -m unittest discover -v` ran 72 tests: 71 passed and one Linux symlink test was skipped. The real-browser verification test uses intercepted local fixtures only. Compile and whitespace checks passed. Linux/Docker CI is configured; report its actual result separately after GitHub execution. This machine has no Docker installation, so no local container build is claimed.
+Windows: `python -m unittest discover -v` ran 72 tests: 71 passed and one Linux symlink test was skipped. The real-browser verification test uses intercepted local fixtures only. Compile and whitespace checks passed. GitHub built the Docker image and passed the staging health/scan-blocking smoke test in run `39863089264`. Linux regressions now run inside the exact deployment image rather than separately installing another browser; check the latest workflow result for that suite. Checkout uses the verified v7 commit and does not persist GitHub credentials. This machine has no Docker installation, so no local container build is claimed.
 
 Sources: [Railway volumes](https://docs.railway.com/volumes), [config-as-code](https://docs.railway.com/config-as-code/reference), [health checks](https://docs.railway.com/deployments/healthchecks).
